@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="🍄 Mushroom Helper" android:textSize="28sp" android:textStyle="bold" />
+        <Switch android:id="@+id/masterSwitch" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="20dp" android:text="總開關" />
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="24dp" android:text="模式" android:textStyle="bold" />
+        <RadioGroup android:id="@+id/modeGroup" android:layout_width="match_parent" android:layout_height="wrap_content">
+            <RadioButton android:id="@+id/modeEco" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="ECO：省電待機" />
+            <RadioButton android:id="@+id/modeWatch" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="WATCH：低頻監看" />
+            <RadioButton android:id="@+id/modeRace" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="RACE：高速搶位" />
+        </RadioGroup>
+        <CheckBox android:id="@+id/pauseLowBattery" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="電量低於 20% 自動暫停" android:checked="true" />
+        <CheckBox android:id="@+id/pauseWhenUserActive" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="使用其他 App 時不搶前景" android:checked="true" />
+        <CheckBox android:id="@+id/blockPaidTicket" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="禁止自動使用蘑菇儲值券" android:checked="true" />
+        <Button android:id="@+id/openAccessibility" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="20dp" android:text="開啟無障礙服務設定" />
+        <TextView android:id="@+id/statusText" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="20dp" android:text="狀態：已停止" android:textSize="16sp" />
+    </LinearLayout>
+</ScrollView>
