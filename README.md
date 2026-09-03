@@ -95,3 +95,5 @@ If profiling later shows the matcher itself is the bottleneck, replace only `Tem
 ## Account / game-policy note
 
 This is an unofficial automation prototype. Automated game interaction can violate a game's terms or anti-cheat rules and can put an account at risk. It does not include server-protocol reverse engineering, authentication bypass, anti-cheat bypass, packet manipulation, or GPS spoofing.
+
+Build trigger initialized.
