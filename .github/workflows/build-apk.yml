@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v052-fixed-signing
+  group: mushroom-helper-apk-build-v053-fixed-signing
   cancel-in-progress: true
 
 jobs:
@@ -19,12 +19,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply V0.5.2 prediction refresh race fix
+      - name: Apply V0.5.3 mandatory ETA census fix
         run: |
-          python3 ci/v054/fix.py
+          python3 ci/v055/fix.py
           git diff --check
+          grep -q "timingCensusRequired" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "handleEtaInspectionDetail" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "MushroomTiming.parseFinishEtaMillis" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "triggerPredictionListRefresh" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          grep -q "PredictionRefreshPolicy.shouldRefresh" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           ! grep -q "tryBlindListTargetTap" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           ! grep -q "listTargetTapX" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "tryBlindMapTargetTap" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
@@ -71,8 +73,8 @@ jobs:
           AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)
           "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "package: name='com.example.pikminhelper'" /tmp/badging.txt
-          grep -q "versionCode='20'" /tmp/badging.txt
-          grep -q "versionName='0.5.2'" /tmp/badging.txt
+          grep -q "versionCode='21'" /tmp/badging.txt
+          grep -q "versionName='0.5.3'" /tmp/badging.txt
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
           "$APKSIGNER" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
           ACTUAL_CERT_SHA256=$(sed -n 's/^V2 Signer: certificate SHA-256 digest: //p' /tmp/apksigner.txt | head -1)
@@ -80,17 +82,17 @@ jobs:
           test "$ACTUAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256"
           echo "Verified signing certificate: $ACTUAL_CERT_SHA256"
 
-      - name: Commit consolidated V0.5.2 service source
+      - name: Commit consolidated V0.5.3 service source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          git diff --cached --quiet || git commit -m "Consolidate V0.5.2 prediction refresh race state machine [skip ci]"
+          git diff --cached --quiet || git commit -m "Consolidate V0.5.3 mandatory ETA census [skip ci]"
           git push
 
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: MushroomHelper-v0.5.2
+          name: MushroomHelper-v0.5.3
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
