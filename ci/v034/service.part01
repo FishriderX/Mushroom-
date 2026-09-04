@@ -1,0 +1,200 @@
+        }
+        return false
+    }
+    private fun handleTeamSelectionNodes(
+        entries: List<NodeEntry>,
+        normalized: String
+    ): Boolean {
+        joinTapAttempts = 0
+        if (FULL_TEAM_REGEX.containsMatchIn(normalized)) {
+            autoTapAttempts = 0
+            markJoinSubmission()
+            findNode(entries, "GO")?.let {
+                clickNode(it.node, 240)
+                return true
+            }
+            tapSelectionFallback(SelectionButton.GO, 240)
+            return true
+        }
+        autoTapAttempts++
+        if (autoTapAttempts > MAX_AUTO_TAP_ATTEMPTS) {
+            startBackOutToNextTarget(2)
+            return true
+        }
+        findNode(entries, "自動")?.let {
+            clickNode(it.node, 180)
+            return true
+        }
+        tapSelectionFallback(SelectionButton.AUTO, 180)
+        return true
+    }
+    private fun handleDetailNodes(
+        entries: List<NodeEntry>,
+        normalized: String
+    ): Boolean {
+        autoTapAttempts = 0
+        if (!isDesiredForCurrentPhase(normalized)) {
+            rejectDetailAndAdvance()
+            return true
+        }
+        val participantCount = extractParticipantCountFromText(normalized)
+        if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+            rejectDetailAndAdvance()
+            return true
+        }
+        if (participantCount == null) return false
+        joinTapAttempts++
+        if (joinTapAttempts > MAX_JOIN_TAP_ATTEMPTS) {
+            startBackOutToNextTarget(1)
+            return true
+        }
+        findNode(entries, "參加")?.let {
+            clickNode(it.node, 220)
+            return true
+        }
+        return false
+    }
+    private fun collectNodes(root: AccessibilityNodeInfo): List<NodeEntry> {
+        val out = ArrayList<NodeEntry>(64)
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < MAX_NODE_VISITS) {
+            val node = queue.removeFirst()
+            visited++
+            val label = clean(
+                listOfNotNull(node.text?.toString(), node.contentDescription?.toString())
+                    .joinToString(" ")
+            )
+            if (label.isNotEmpty()) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                out.add(NodeEntry(node, label, bounds))
+            }
+            val childCount = node.childCount.coerceAtMost(MAX_CHILDREN_PER_NODE)
+            for (i in 0 until childCount) {
+                node.getChild(i)?.let(queue::addLast)
+            }
+        }
+        return out
+    }
+    private fun findNode(entries: List<NodeEntry>, needle: String): NodeEntry? {
+        val n = clean(needle)
+        return entries.firstOrNull { clean(it.text).contains(n) }
+    }
+    private fun findExactNode(entries: List<NodeEntry>, needle: String): NodeEntry? {
+        val n = clean(needle)
+        return entries.firstOrNull { clean(it.text) == n }
+    }
+    private fun clickNode(node: AccessibilityNodeInfo, cooldownMs: Long) {
+        if (!prefs.enabled) return
+        var current: AccessibilityNodeInfo? = node
+        repeat(5) {
+            val candidate = current ?: return@repeat
+            if (candidate.isClickable && candidate.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
+                return
+            }
+            current = candidate.parent
+        }
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        if (!bounds.isEmpty) {
+            verifiedTap(bounds.exactCenterX(), bounds.exactCenterY(), cooldownMs)
+        }
+    }
+    private fun requestOcrFallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastOcrAt < ocrIntervalMs()) return
+        if (!ocrBusy.compareAndSet(false, true)) return
+        lastOcrAt = now
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            imageExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    val hw = result.hardwareBuffer
+                    val wrapped = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
+                    val original = wrapped?.copy(Bitmap.Config.ARGB_8888, false)
+                    hw.close()
+                    if (original == null) {
+                        ocrBusy.set(false)
+                        return
+                    }
+                    val fingerprint = frameFingerprint(original)
+                    val current = SystemClock.elapsedRealtime()
+                    if (
+                        fingerprint == lastFrameFingerprint &&
+                        current - lastProcessedFrameAt < unchangedFrameHoldMs()
+                    ) {
+                        original.recycle()
+                        ocrBusy.set(false)
+                        return
+                    }
+                    lastFrameFingerprint = fingerprint
+                    lastProcessedFrameAt = current
+                    val frame = prepareOcrFrame(original)
+                    recognize(frame)
+                }
+                override fun onFailure(errorCode: Int) {
+                    ocrBusy.set(false)
+                }
+            }
+        )
+    }
+    private fun prepareOcrFrame(original: Bitmap): OcrFrame {
+        if (original.width <= OCR_MAX_WIDTH) return OcrFrame(original, 1f, 1f)
+        val targetWidth = OCR_MAX_WIDTH
+        val targetHeight = (original.height * (targetWidth.toFloat() / original.width)).toInt()
+        val scaled = Bitmap.createScaledBitmap(original, targetWidth, targetHeight, true)
+        val scaleX = original.width.toFloat() / scaled.width
+        val scaleY = original.height.toFloat() / scaled.height
+        original.recycle()
+        return OcrFrame(scaled, scaleX, scaleY)
+    }
+    private fun recognize(frame: OcrFrame) {
+        recognizer.process(InputImage.fromBitmap(frame.bitmap, 0))
+            .addOnSuccessListener(imageExecutor) { result -> handleOcrScreen(frame, result) }
+            .addOnCompleteListener(imageExecutor) {
+                frame.bitmap.recycle()
+                ocrBusy.set(false)
+            }
+    }
+    private fun handleOcrScreen(frame: OcrFrame, result: Text) {
+        if (!prefs.enabled) return
+        val lines = result.textBlocks.flatMap { it.lines }
+        val normalized = clean(result.text)
+        updateDailyRemaining(normalized)
+        if (isDoneForToday()) return
+        if (containsTicketWarning(normalized) || containsJoinFailure(normalized)) {
+            prepareFailureRecovery()
+            findOcrLine(lines, "關閉")?.let {
+                tapOcrButton(frame, it, 220)
+            } ?: goBack(220)
+            return
+        }
+        if (backOutStepsRemaining > 0) {
+            if (isMushroomList(normalized)) {
+                backOutStepsRemaining = 0
+                forceAdvanceOnList = true
+            } else {
+                backOutStepsRemaining--
+                goBack(200)
+                return
+            }
+        }
+        if (normalized.contains("選擇派出皮克敏")) {
+            handleTeamSelectionOcr(frame, lines, normalized)
+            return
+        }
+        if (normalized.contains("參加") && normalized.contains("蘑菇")) {
+            handleDetailOcr(frame, lines, normalized)
+            return
+        }
+        if (isMushroomList(normalized)) {
+            handleMushroomList(frame, lines, normalized)
+            return
+        }
+        if (looksLikeBirdMap(frame.bitmap, lines, normalized)) {
+            handleBirdMap(frame, lines)
