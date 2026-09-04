@@ -21,6 +21,7 @@ jobs:
 
       - name: Apply V0.4.3 bird-view standby fix
         run: |
+          python3 ci/v043/prepare_fix.py
           python3 ci/v043/fix.py
           git diff --check
           test -s app/src/main/java/com/example/pikminhelper/automation/ExploreScreenRules.kt
