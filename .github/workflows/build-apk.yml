@@ -19,6 +19,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Assemble V0.3.4 service source
+        run: |
+          cat ci/v034/service.part00 \
+              ci/v034/service.part01 \
+              ci/v034/service.part02 \
+              ci/v034/service.part03 \
+              ci/v034/service.part04 \
+              ci/v034/service.part05 \
+              > app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
