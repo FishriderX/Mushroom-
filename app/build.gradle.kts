@@ -11,13 +11,10 @@ android {
         applicationId = "com.example.pikminhelper"
         minSdk = 30
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.5.2"
+        versionCode = 21
+        versionName = "0.5.3"
     }
 
-    // CI decodes the project-owned fixed key to this exact path before Gradle
-    // starts. Explicitly binding debug signing here prevents Android/Gradle
-    // home-directory or cache behavior from silently selecting another key.
     val fixedDebugKeystore = rootProject.file("ci/signing/debug.keystore")
     signingConfigs {
         getByName("debug") {
