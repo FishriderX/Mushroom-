@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v036
+  group: mushroom-helper-apk-build-v037
   cancel-in-progress: true
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Assemble V0.3.6 service source
+      - name: Assemble V0.3.7 service source
         run: |
           cat ci/v034/service.part00 \
               ci/v034/service.part01 \
@@ -30,6 +30,7 @@ jobs:
               > app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           python3 ci/v035/patch.py
           python3 ci/v036/patch.py
+          python3 ci/v037/patch.py
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -42,11 +43,12 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Restore stable Android debug signing key
-        uses: actions/cache@v4
-        with:
-          path: ~/.android/debug.keystore
-          key: mushroom-helper-debug-keystore-v1
+      - name: Install fixed debug signing key
+        run: |
+          mkdir -p ~/.android
+          base64 -d ci/signing/debug.keystore.b64 > ~/.android/debug.keystore
+          test "$(sha256sum ~/.android/debug.keystore | awk '{print $1}')" = "f7dbc40941e43ac6940796b03bb9f69ad416c5af7c5a50a1c03c58b818564662"
+          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null
 
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
