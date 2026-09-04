@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.pikminhelper"
         minSdk = 30
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
     }
 
     compileOptions {
@@ -35,7 +35,7 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.activity:activity-ktx:1.10.0")
 
-    // Bundled Traditional/Simplified Chinese OCR model. This keeps recognition
-    // available even when the phone has no network connection while racing.
+    // OCR is only a fallback when Pikmin's Unity UI does not expose semantic nodes.
+    // The model is bundled so a race does not depend on network availability.
     implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
 }
