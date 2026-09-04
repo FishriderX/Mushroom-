@@ -186,29 +186,20 @@ replace_once(
 '''
 )
 
-# Suppress Unity's own scroll animation events briefly after our gestures.
-replace_once(
-    '''            listContextActive = true
+# Suppress Unity's own scroll animation events briefly after either carousel gesture.
+gesture_needle = '''            listContextActive = true
             listProgressGeneration++
             val dm = resources.displayMetrics
-''',
-    '''            listContextActive = true
+'''
+gesture_replacement = '''            listContextActive = true
             listProgressGeneration++
             suppressListMutationEventsUntil = SystemClock.elapsedRealtime() + RACE_SELF_GESTURE_EVENT_SUPPRESS_MS
             val dm = resources.displayMetrics
 '''
-)
-replace_once(
-    '''            listContextActive = true
-            listProgressGeneration++
-            val dm = resources.displayMetrics
-''',
-    '''            listContextActive = true
-            listProgressGeneration++
-            suppressListMutationEventsUntil = SystemClock.elapsedRealtime() + RACE_SELF_GESTURE_EVENT_SUPPRESS_MS
-            val dm = resources.displayMetrics
-'''
-)
+gesture_count = s.count(gesture_needle)
+if gesture_count != 2:
+    raise SystemExit(f"expected two list gesture bodies, found {gesture_count}")
+s = s.replace(gesture_needle, gesture_replacement, 2)
 
 # Daily rollover starts cleanly rather than inheriting a parked timestamp from
 # the previous day.
