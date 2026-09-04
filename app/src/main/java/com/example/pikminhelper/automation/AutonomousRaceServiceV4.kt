@@ -51,6 +51,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     @Volatile private var rewindSwipeCount = 0
     @Volatile private var listProgressGeneration = 0L
     @Volatile private var listContextActive = false
+    @Volatile private var listGestureInFlight = false
     @Volatile private var raceSweepActive = false
     @Volatile private var raceBackupSweepAt = 0L
     @Volatile private var urgentListChange = false
@@ -121,6 +122,10 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             if (root.packageName?.toString() != PIKMIN_PACKAGE) return
             if (!listContextActive) return
 
+            if (listGestureInFlight) {
+                main.postDelayed(this, LIST_GESTURE_BUSY_RETRY_MS)
+                return
+            }
             if (ocrBusy.get()) {
                 main.postDelayed(this, LIST_BUSY_RETRY_MS)
                 return
@@ -1576,54 +1581,82 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         main.postDelayed(listWatchdogKick, delayMs + 20L)
     }
     private fun swipeListReliable(cooldownMs: Long) {
+        dispatchListSwipe(forward = true, cooldownMs = cooldownMs)
+    }
+
+    private fun swipeListBackwardReliable(cooldownMs: Long) {
+        dispatchListSwipe(forward = false, cooldownMs = cooldownMs)
+    }
+
+    private fun dispatchListSwipe(forward: Boolean, cooldownMs: Long) {
         if (!prefs.enabled) return
         main.post {
             if (!prefs.enabled) return@post
+            if (listGestureInFlight) {
+                main.removeCallbacks(listWatchdogKick)
+                main.postDelayed(listWatchdogKick, LIST_GESTURE_BUSY_RETRY_MS)
+                return@post
+            }
+
             listContextActive = true
             listProgressGeneration++
-            suppressListMutationEventsUntil = SystemClock.elapsedRealtime() + RACE_SELF_GESTURE_EVENT_SUPPRESS_MS
+            listGestureInFlight = true
+            suppressListMutationEventsUntil =
+                SystemClock.elapsedRealtime() + RACE_SELF_GESTURE_EVENT_SUPPRESS_MS
+
             val dm = resources.displayMetrics
             val y = dm.heightPixels * 0.705f
+            val fromX = dm.widthPixels * if (forward) 0.86f else 0.14f
+            val toX = dm.widthPixels * if (forward) 0.14f else 0.86f
             val path = Path().apply {
-                moveTo(dm.widthPixels * 0.86f, y)
-                lineTo(dm.widthPixels * 0.14f, y)
+                moveTo(fromX, y)
+                lineTo(toX, y)
             }
             val gesture = GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0, 170))
+                .addStroke(GestureDescription.StrokeDescription(path, 0, LIST_GESTURE_DURATION_MS))
                 .build()
-            dispatchGesture(gesture, null, null)
-            lastFrameFingerprint = Long.MIN_VALUE
-            lastProcessedFrameAt = 0L
-            lastOcrAt = 0L
+
             nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
             main.removeCallbacks(listWatchdogKick)
-            main.postDelayed(listWatchdogKick, cooldownMs + 80L)
+
+            val accepted = dispatchGesture(
+                gesture,
+                object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        super.onCompleted(gestureDescription)
+                        listGestureInFlight = false
+                        armListAfterGesture(LIST_GESTURE_SETTLE_MS)
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        super.onCancelled(gestureDescription)
+                        listGestureInFlight = false
+                        armListAfterGesture(LIST_GESTURE_CANCEL_RETRY_MS)
+                    }
+                },
+                main
+            )
+
+            if (!accepted) {
+                listGestureInFlight = false
+                armListAfterGesture(LIST_GESTURE_CANCEL_RETRY_MS)
+            } else {
+                // Hard fallback in case a device/Unity combination delays the
+                // normal callback. The watchdog sees in-flight and waits rather
+                // than injecting a second gesture on top of this one.
+                main.postDelayed(listWatchdogKick, LIST_GESTURE_HARD_TIMEOUT_MS)
+            }
         }
     }
-    private fun swipeListBackwardReliable(cooldownMs: Long) {
-        if (!prefs.enabled) return
-        main.post {
-            if (!prefs.enabled) return@post
-            listContextActive = true
-            listProgressGeneration++
-            suppressListMutationEventsUntil = SystemClock.elapsedRealtime() + RACE_SELF_GESTURE_EVENT_SUPPRESS_MS
-            val dm = resources.displayMetrics
-            val y = dm.heightPixels * 0.705f
-            val path = Path().apply {
-                moveTo(dm.widthPixels * 0.14f, y)
-                lineTo(dm.widthPixels * 0.86f, y)
-            }
-            val gesture = GestureDescription.Builder()
-                .addStroke(GestureDescription.StrokeDescription(path, 0, 170))
-                .build()
-            dispatchGesture(gesture, null, null)
-            lastFrameFingerprint = Long.MIN_VALUE
-            lastProcessedFrameAt = 0L
-            lastOcrAt = 0L
-            nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
-            main.removeCallbacks(listWatchdogKick)
-            main.postDelayed(listWatchdogKick, cooldownMs + 80L)
-        }
+
+    private fun armListAfterGesture(delayMs: Long) {
+        if (!prefs.enabled || !listContextActive) return
+        lastFrameFingerprint = Long.MIN_VALUE
+        lastProcessedFrameAt = 0L
+        lastOcrAt = 0L
+        nextActionAt = SystemClock.elapsedRealtime() + delayMs
+        main.removeCallbacks(listWatchdogKick)
+        main.postDelayed(listWatchdogKick, delayMs)
     }
     private fun findListScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -1673,6 +1706,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     }
     override fun onDestroy() {
         listContextActive = false
+        listGestureInFlight = false
         raceSweepActive = false
         urgentListChange = false
         parkedAtStart = false
@@ -1704,6 +1738,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val LIST_PROGRESS_GUARD_MS = 900L
         private const val LIST_STALL_RETRY_MS = 180L
         private const val DECOR_GUARD_RETRY_MS = 350L
+        private const val LIST_GESTURE_DURATION_MS = 190L
+        private const val LIST_GESTURE_SETTLE_MS = 90L
+        private const val LIST_GESTURE_CANCEL_RETRY_MS = 140L
+        private const val LIST_GESTURE_BUSY_RETRY_MS = 80L
+        private const val LIST_GESTURE_HARD_TIMEOUT_MS = 850L
         private const val RACE_BACKUP_SWEEP_MS = 20_000L
         private const val RACE_SWEEP_COOLDOWN_MS = 150L
         private const val RACE_REWIND_COOLDOWN_MS = 120L
