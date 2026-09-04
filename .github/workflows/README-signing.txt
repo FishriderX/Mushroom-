@@ -1,0 +1,1 @@
+Mushroom Helper uses a cached debug keystore in GitHub Actions so successive APK builds keep the same signing identity. The first build after enabling this cache becomes the signing baseline; later builds can update it in-place on Android.
