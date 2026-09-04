@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v052
+  group: mushroom-helper-apk-build-v052-fixed-signing
   cancel-in-progress: true
 
 jobs:
@@ -44,20 +44,26 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      - name: Install fixed debug signing key
+      - name: Install exact project signing key
         run: |
-          mkdir -p ~/.android
-          base64 -d ci/signing/debug.keystore.b64 > ~/.android/debug.keystore
-          test "$(sha256sum ~/.android/debug.keystore | awk '{print $1}')" = "f7dbc40941e43ac6940796b03bb9f69ad416c5af7c5a50a1c03c58b818564662"
-          keytool -list -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+          mkdir -p ci/signing
+          base64 -d ci/signing/debug.keystore.b64 > ci/signing/debug.keystore
+          test "$(sha256sum ci/signing/debug.keystore | awk '{print $1}')" = "f7dbc40941e43ac6940796b03bb9f69ad416c5af7c5a50a1c03c58b818564662"
+          keytool -list -keystore ci/signing/debug.keystore -storepass android -alias androiddebugkey >/dev/null
+          EXPECTED_CERT_SHA256=$(keytool -exportcert -keystore ci/signing/debug.keystore -storepass android -alias androiddebugkey | sha256sum | awk '{print $1}')
+          echo "EXPECTED_CERT_SHA256=$EXPECTED_CERT_SHA256" >> "$GITHUB_ENV"
+          echo "Expected signing certificate: $EXPECTED_CERT_SHA256"
 
-      - name: Run unit tests
-        run: gradle :app:testDebugUnitTest --stacktrace
+      - name: Clean build state
+        run: gradle :app:clean --no-build-cache --stacktrace
 
-      - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Run unit tests without build cache
+        run: gradle :app:testDebugUnitTest --no-build-cache --stacktrace
 
-      - name: Verify APK package, version, signing and archive
+      - name: Build debug APK without build cache
+        run: gradle :app:assembleDebug --no-build-cache --stacktrace
+
+      - name: Verify APK package, version, exact signer and archive
         run: |
           APK=app/build/outputs/apk/debug/app-debug.apk
           test -s "$APK"
@@ -69,7 +75,10 @@ jobs:
           grep -q "versionName='0.5.2'" /tmp/badging.txt
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
           "$APKSIGNER" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
-          grep -q "certificate SHA-256 digest: 69f7f0545e13727a7923071d68d3563d1ad955b67bf2891198a9fa6e300caf82" /tmp/apksigner.txt
+          ACTUAL_CERT_SHA256=$(sed -n 's/^V2 Signer: certificate SHA-256 digest: //p' /tmp/apksigner.txt | head -1)
+          test -n "$ACTUAL_CERT_SHA256"
+          test "$ACTUAL_CERT_SHA256" = "$EXPECTED_CERT_SHA256"
+          echo "Verified signing certificate: $ACTUAL_CERT_SHA256"
 
       - name: Commit consolidated V0.5.2 service source
         run: |
