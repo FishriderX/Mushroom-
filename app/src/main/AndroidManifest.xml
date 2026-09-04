@@ -19,7 +19,7 @@
         </activity>
 
         <service
-            android:name=".automation.PikminAccessibilityService"
+            android:name=".automation.AutonomousRaceService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="false">
             <intent-filter>
