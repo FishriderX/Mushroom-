@@ -1003,8 +1003,10 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         // A genuine Pikmin list mutation outranks whatever old scan was doing.
         // Stop inspection/patrol, return to card 1 if needed, then run a fresh
         // priority search immediately.
-        if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby && !etaInspectionActive) {
+        if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby) {
             urgentListChange = false
+            etaInspectionActive = false
+            etaInspectionAdvancePending = false
             parkedAtStart = false
             phase = firstPhase()
             raceSweepActive = true
@@ -1026,30 +1028,6 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return
         }
 
-        if (
-            prefs.mode == RunMode.RACE &&
-            timingCensusRequired &&
-            predictedSpawnAt <= 0L &&
-            !predictionRefreshPending &&
-            !targetMapLockActive &&
-            !targetMapLockPending
-        ) {
-            val atStart = position?.first == 1 || (position == null && listSwipeCount == 0)
-            if (!atStart) {
-                beginRewind(RewindResume.INSPECT)
-                return
-            }
-            etaInspectionActive = true
-            etaInspectionAdvancePending = false
-            etaInspectionCurrentWasLast = false
-            etaInspectionCurrentPosition = -1
-            etaInspectionCount = 0
-            listSwipeCount = 0
-            lastListPosition = position?.first ?: -1
-            stuckListPositionCount = 0
-            handleEtaInspectionList(frame, lines, reachedEnd, position)
-            return
-        }
 
         if (position != null && isListPositionUnreachable(position.first)) {
             if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
@@ -1508,13 +1486,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val now = SystemClock.elapsedRealtime()
         timingCensusCompletedAt = now
         timingCensusRequired = false
-        nextEtaInspectionAt = now + ETA_REINSPECTION_MS
+        nextEtaInspectionAt = if (predictedSpawnAt > 0L)
+            now + ETA_REINSPECTION_MS
+        else
+            now + ETA_FAILED_RETRY_MS
         phase = firstPhase()
         if (predictedSpawnAt > 0L && predictedSourcePosition > 0) {
             beginRewind(RewindResume.TARGET)
         } else {
-            timingCensusRequired = true
-            nextEtaInspectionAt = now + ETA_FAILED_RETRY_MS
             beginRewind(RewindResume.PARK)
         }
     }
@@ -1544,8 +1523,20 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return
         }
 
-        if (prefs.mode == RunMode.RACE && predictedSpawnAt <= 0L && now >= nextEtaInspectionAt) {
+        if (
+            prefs.mode == RunMode.RACE &&
+            predictedSpawnAt <= 0L &&
+            !timingCensusRequired &&
+            nextEtaInspectionAt > 0L &&
+            now >= nextEtaInspectionAt
+        ) {
             timingCensusRequired = true
+            parkedAtStart = false
+            raceSweepActive = true
+            raceBackupSweepAt = 0L
+            listSwipeCount = 0
+            lastListPosition = -1
+            stuckListPositionCount = 0
             scheduleFreshListScan(180L)
             return
         }
@@ -2218,10 +2209,12 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                 now + PredictionRefreshPolicy.RETRY_REFRESH_INTERVAL_MS
             )
             beginRewind(RewindResume.STANDBY)
-        } else if (predictedSpawnAt > 0L || now < nextEtaInspectionAt) {
+        } else if (predictedSpawnAt > 0L) {
             beginRewind(RewindResume.PARK)
-        } else {
+        } else if (timingCensusRequired) {
             beginRewind(RewindResume.INSPECT)
+        } else {
+            beginRewind(RewindResume.PARK)
         }
     }
     private fun markJoinSubmission() {
