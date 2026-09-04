@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v043
+  group: mushroom-helper-apk-build-v044
   cancel-in-progress: true
 
 jobs:
@@ -19,14 +19,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply V0.4.3 bird-view standby fix
+      - name: Apply V0.4.4 fast bird-map race fix
         run: |
-          python3 ci/v043/prepare_fix.py
-          python3 ci/v043/fix.py
+          python3 ci/v044/fix.py
           git diff --check
-          test -s app/src/main/java/com/example/pikminhelper/automation/ExploreScreenRules.kt
-          grep -q "targetMapLockActive" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          grep -q "前往這裡" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "requestTargetMapFastFrame" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "FAST_MAP_SCREENSHOT_INTERVAL_MS = 350L" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "fastMapBaselineReady" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "GestureResultCallback" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
 
       - name: Set up Java 17
@@ -61,21 +60,21 @@ jobs:
           AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)
           "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "package: name='com.example.pikminhelper'" /tmp/badging.txt
-          grep -q "versionName='0.4.3'" /tmp/badging.txt
+          grep -q "versionName='0.4.4'" /tmp/badging.txt
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
           "$APKSIGNER" verify --verbose --print-certs "$APK"
 
-      - name: Commit consolidated V0.4.3 service source
+      - name: Commit consolidated V0.4.4 service source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          git diff --cached --quiet || git commit -m "Consolidate V0.4.3 bird-view standby [skip ci]"
+          git diff --cached --quiet || git commit -m "Consolidate V0.4.4 fast bird-map race path [skip ci]"
           git push
 
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: MushroomHelper-v0.4.3
+          name: MushroomHelper-v0.4.4
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
