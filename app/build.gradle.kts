@@ -15,6 +15,27 @@ android {
         versionName = "0.5.2"
     }
 
+    // CI decodes the project-owned fixed key to this exact path before Gradle
+    // starts. Explicitly binding debug signing here prevents Android/Gradle
+    // home-directory or cache behavior from silently selecting another key.
+    val fixedDebugKeystore = rootProject.file("ci/signing/debug.keystore")
+    signingConfigs {
+        getByName("debug") {
+            if (fixedDebugKeystore.exists()) {
+                storeFile = fixedDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
