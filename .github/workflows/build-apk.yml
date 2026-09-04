@@ -6,24 +6,24 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v040
+  group: mushroom-helper-apk-build-v041
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify source tree
+      - name: Apply V0.4.1 decor hard guard
         run: |
-          test -s app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          test -s app/src/main/java/com/example/pikminhelper/automation/MushroomTiming.kt
+          python3 ci/v041/fix.py
           git diff --check
+          test -s app/src/main/java/com/example/pikminhelper/automation/ExploreScreenRules.kt
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -57,13 +57,21 @@ jobs:
           AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)
           "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "package: name='com.example.pikminhelper'" /tmp/badging.txt
-          grep -q "versionName='0.4.0'" /tmp/badging.txt
+          grep -q "versionName='0.4.1'" /tmp/badging.txt
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
           "$APKSIGNER" verify --verbose --print-certs "$APK"
+
+      - name: Commit consolidated V0.4.1 service source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          git diff --cached --quiet || git commit -m "Consolidate V0.4.1 decor guard [skip ci]"
+          git push
 
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: MushroomHelper-v0.4.0
+          name: MushroomHelper-v0.4.1
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
