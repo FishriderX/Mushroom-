@@ -95,7 +95,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     @Volatile private var phase: SearchPhase = SearchPhase.EVENT
     @Volatile private var detailCameFromBirdMap = false
     @Volatile private var lastBirdMapTapKey: Int? = null
+    @Volatile private var detailSourceListPosition = -1
     private val rejectedBirdMapPoints = ConcurrentHashMap<Int, Long>()
+    private val unreachableListPositions = ConcurrentHashMap<Int, Long>()
     private enum class SearchPhase { GIANT, EVENT, ANY }
     private enum class RewindResume { SEARCH, INSPECT, PARK, TARGET }
     private enum class SelectionButton { AUTO, GO }
@@ -314,6 +316,10 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return handleTeamSelectionNodes(entries, normalized)
         }
         if (targetDetailOpenPending && looksLikeMushroomDetail(normalized)) {
+            if (isOutOfRangeDetail(entries, normalized)) {
+                rejectTargetOutOfRange()
+                return true
+            }
             findGoToMapNode(entries)?.let {
                 targetDetailOpenPending = false
                 targetMapOpenAttempts = 0
@@ -324,7 +330,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return false
         }
         if (etaInspectionActive && looksLikeMushroomDetail(normalized)) {
-            handleEtaInspectionDetail(normalized)
+            if (isOutOfRangeDetail(entries, normalized)) {
+                skipEtaOutOfRange()
+            } else {
+                handleEtaInspectionDetail(normalized)
+            }
             return true
         }
         if (normalized.contains("參加") && normalized.contains("蘑菇")) {
@@ -384,6 +394,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         normalized: String
     ): Boolean {
         autoTapAttempts = 0
+        if (isOutOfRangeDetail(entries, normalized)) {
+            markCurrentTargetUnreachable()
+            rejectDetailAndAdvance()
+            return true
+        }
         if (!isDesiredForCurrentPhase(normalized)) {
             rejectDetailAndAdvance()
             return true
@@ -732,12 +747,20 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         if (targetDetailOpenPending && looksLikeMushroomDetail(normalized)) {
             listContextActive = false
-            handleTargetDetailToBirdMap(frame, lines)
+            if (MushroomReachability.isOutOfRangeText(normalized)) {
+                rejectTargetOutOfRange()
+            } else {
+                handleTargetDetailToBirdMap(frame, lines)
+            }
             return
         }
         if (etaInspectionActive && looksLikeMushroomDetail(normalized)) {
             listContextActive = false
-            handleEtaInspectionDetail(normalized)
+            if (MushroomReachability.isOutOfRangeText(normalized)) {
+                skipEtaOutOfRange()
+            } else {
+                handleEtaInspectionDetail(normalized)
+            }
             return
         }
         if (normalized.contains("參加") && normalized.contains("蘑菇")) {
@@ -820,6 +843,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         normalized: String
     ) {
         autoTapAttempts = 0
+        if (MushroomReachability.isOutOfRangeText(normalized)) {
+            markCurrentTargetUnreachable()
+            rejectDetailAndAdvance()
+            return
+        }
         if (!isDesiredForCurrentPhase(normalized)) {
             rejectDetailAndAdvance()
             return
@@ -866,6 +894,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         // priority search immediately.
         if (prefs.mode == RunMode.RACE && urgentListChange) {
             urgentListChange = false
+            unreachableListPositions.clear()
             etaInspectionActive = false
             etaInspectionAdvancePending = false
             parkedAtStart = false
@@ -886,6 +915,16 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
 
         if (etaInspectionActive) {
             handleEtaInspectionList(frame, lines, reachedEnd, position)
+            return
+        }
+
+        if (position != null && isListPositionUnreachable(position.first)) {
+            if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
+                advanceSearchPhaseAndRefresh()
+            } else {
+                listSwipeCount++
+                swipeListReliable(searchSwipeCooldownMs())
+            }
             return
         }
 
@@ -914,6 +953,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             }
 
             parkedAtStart = false
+            detailSourceListPosition = position?.first ?: lastListPosition
             listProgressGeneration++
             tapOcrButton(frame, target, RACE_TARGET_TAP_COOLDOWN_MS)
             return
@@ -1054,6 +1094,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val title = findAnyMushroomTitle(lines)
         if (title != null) {
             etaInspectionCurrentPosition = position?.first ?: (etaInspectionCount + 1)
+            detailSourceListPosition = etaInspectionCurrentPosition
             etaInspectionCurrentWasLast = reachedEnd
             etaInspectionCount++
             listProgressGeneration++
@@ -1109,6 +1150,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
 
         targetPositioning = false
+        detailSourceListPosition = predictedSourcePosition
         targetDetailOpenPending = true
         targetMapOpenAttempts = 0
         listProgressGeneration++
@@ -1165,6 +1207,10 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     }
 
     private fun handleEtaInspectionDetail(normalized: String) {
+        if (MushroomReachability.isOutOfRangeText(normalized)) {
+            skipEtaOutOfRange()
+            return
+        }
         val finishEtaMs = MushroomTiming.parseFinishEtaMillis(normalized)
         if (finishEtaMs != null && finishEtaMs in 0L..ETA_INSPECTION_HORIZON_MS) {
             recordPredictedRespawn(finishEtaMs, etaInspectionCurrentPosition)
@@ -1357,6 +1403,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             candidates.addAll(findUnbadgedMushroomCandidates(frame.bitmap, badges))
         }
         val best = candidates
+            .filter { isWithinLocalBirdSearchArea(it.x, it.y, frame.bitmap) }
             .filterNot { isMapPointRejected(it.key) }
             .maxByOrNull { it.score }
         if (best == null) {
@@ -1371,6 +1418,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             220
         )
     }
+    private fun isWithinLocalBirdSearchArea(x: Float, y: Float, bitmap: Bitmap): Boolean {
+        val centerX = bitmap.width * TARGET_MAP_CENTER_X
+        val centerY = bitmap.height * TARGET_MAP_CENTER_Y
+        val dx = (x - centerX) / (bitmap.width * LOCAL_BIRD_SEARCH_X_RADIUS)
+        val dy = (y - centerY) / (bitmap.height * LOCAL_BIRD_SEARCH_Y_RADIUS)
+        return dx * dx + dy * dy <= 1f
+    }
+
     private fun handleTargetLockedBirdMap(frame: OcrFrame, lines: List<Text.Line>) {
         val now = SystemClock.elapsedRealtime()
         if (predictedSpawnAt <= 0L) {
@@ -1925,6 +1980,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         etaInspectionCount = 0
         nextEtaInspectionAt = 0L
         clearPrediction()
+        unreachableListPositions.clear()
+        detailSourceListPosition = -1
         detailCameFromBirdMap = false
         lastBirdMapTapKey = null
     }
@@ -1967,6 +2024,50 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         backOutStepsRemaining--
         goBack(200)
     }
+    private fun isOutOfRangeDetail(entries: List<NodeEntry>, normalized: String): Boolean {
+        if (MushroomReachability.isOutOfRangeText(normalized)) return true
+        val join = findNode(entries, "參加") ?: return false
+        return !join.node.isEnabled
+    }
+
+    private fun markCurrentTargetUnreachable() {
+        val position = detailSourceListPosition
+        if (position > 0) {
+            unreachableListPositions[position] =
+                SystemClock.elapsedRealtime() + OUT_OF_RANGE_POSITION_CACHE_MS
+        }
+    }
+
+    private fun isListPositionUnreachable(position: Int): Boolean {
+        val until = unreachableListPositions[position] ?: return false
+        if (SystemClock.elapsedRealtime() >= until) {
+            unreachableListPositions.remove(position)
+            return false
+        }
+        return true
+    }
+
+    private fun skipEtaOutOfRange() {
+        val position = etaInspectionCurrentPosition.takeIf { it > 0 } ?: detailSourceListPosition
+        if (position > 0) {
+            unreachableListPositions[position] =
+                SystemClock.elapsedRealtime() + OUT_OF_RANGE_POSITION_CACHE_MS
+        }
+        etaInspectionAdvancePending = true
+        listContextActive = false
+        goBack(ETA_DETAIL_BACK_COOLDOWN_MS)
+    }
+
+    private fun rejectTargetOutOfRange() {
+        markCurrentTargetUnreachable()
+        clearPrediction()
+        targetDetailOpenPending = false
+        targetMapLockPending = false
+        targetMapLockActive = false
+        forceAdvanceOnList = true
+        goBack(220L)
+    }
+
     private fun updateDailyRemaining(value: String) {
         val match = DAILY_REMAINING_REGEX.find(clean(value)) ?: return
         val remaining = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return
@@ -1999,6 +2100,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             etaInspectionCount = 0
             nextEtaInspectionAt = 0L
             clearPrediction()
+            unreachableListPositions.clear()
+            detailSourceListPosition = -1
             nextActionAt = 0L
         }
     }
@@ -2218,6 +2321,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val DAILY_DONE_RECHECK_MS = 60_000L
         private const val POST_JOIN_REFRESH_MS = 900L
         private const val MAP_REJECT_MS = 30_000L
+        private const val OUT_OF_RANGE_POSITION_CACHE_MS = 5L * 60L * 1000L
         private const val MIN_MUSHROOM_PATCH_SCORE = 32
         private const val LIST_BUSY_RETRY_MS = 140L
         private const val LIST_PROGRESS_GUARD_MS = 900L
@@ -2262,6 +2366,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private val FULL_TEAM_REGEX = Regex("(\\d{1,3})/\\1")
         private const val TARGET_MAP_CENTER_X = 0.50f
         private const val TARGET_MAP_CENTER_Y = 0.46f
+        private const val LOCAL_BIRD_SEARCH_X_RADIUS = 0.24f
+        private const val LOCAL_BIRD_SEARCH_Y_RADIUS = 0.28f
         private const val TARGET_MAP_ANCHOR_RADIUS_NORM_SQ = 0.040f
         private val GO_TO_MAP_TEXTS = listOf("前往這裡", "前往此處", "前往該處")
         private val DAILY_REMAINING_REGEX = Regex("今天還剩下([0-9]{1,2})次")
