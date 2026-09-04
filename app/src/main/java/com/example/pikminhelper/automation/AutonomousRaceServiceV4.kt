@@ -216,7 +216,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                         now >= suppressListMutationEventsUntil &&
                         now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS &&
                         now <= predictionWindowUntil &&
-                        now - lastBlindTargetTapAt >= DIRECT_TARGET_TAP_INTERVAL_MS
+                        now - lastBlindTargetTapAt >= RaceTapPolicy.intervalMs(now, predictedSpawnAt)
                     ) {
                         tryBlindListTargetTap(now)
                     }
@@ -1330,8 +1330,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (!listTargetStandby || !listContextActive || predictedSpawnAt <= 0L) return false
         if (listTargetTapX <= 0f || listTargetTapY <= 0f) return false
         if (now > predictionWindowUntil) return false
-        if (now - lastBlindTargetTapAt < DIRECT_TARGET_TAP_INTERVAL_MS) return false
-        if (blindTargetTapAttempts >= MAX_DIRECT_TARGET_TAPS) return false
+        if (now - lastBlindTargetTapAt < RaceTapPolicy.intervalMs(now, predictedSpawnAt)) return false
         lastBlindTargetTapAt = now
         blindTargetTapAttempts++
         raceTapVerificationUntil = now + DIRECT_TAP_VERIFY_MS
@@ -1342,8 +1341,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     private fun tryBlindMapTargetTap(now: Long): Boolean {
         if (!targetMapLockActive || !targetMapAnchorReady || predictedSpawnAt <= 0L) return false
         if (now > predictionWindowUntil) return false
-        if (now - lastBlindTargetTapAt < DIRECT_TARGET_TAP_INTERVAL_MS) return false
-        if (blindTargetTapAttempts >= MAX_DIRECT_TARGET_TAPS) return false
+        if (now - lastBlindTargetTapAt < RaceTapPolicy.intervalMs(now, predictedSpawnAt)) return false
         lastBlindTargetTapAt = now
         blindTargetTapAttempts++
         raceTapVerificationUntil = now + DIRECT_TAP_VERIFY_MS
@@ -2521,10 +2519,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val FAST_MAP_X_RADIUS = 0.18f
         private const val FAST_MAP_Y_RADIUS = 0.14f
         private const val DIRECT_TAP_LEAD_MS = 800L
-        private const val DIRECT_TARGET_TAP_INTERVAL_MS = 380L
         private const val DIRECT_TAP_VERIFY_MS = 260L
         private const val DIRECT_STANDBY_POLL_MS = 180L
-        private const val MAX_DIRECT_TARGET_TAPS = 8
         private const val MUSHROOM_RESPAWN_DELAY_MS = 5L * 60L * 1000L
         private const val PREDICTION_PREWARM_LEAD_MS = 30_000L
         private const val PREDICTION_AFTER_WINDOW_MS = 90_000L
