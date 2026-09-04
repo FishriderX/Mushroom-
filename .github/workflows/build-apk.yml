@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mushroom-helper-apk-build-v051
+  group: mushroom-helper-apk-build-v052
   cancel-in-progress: true
 
 jobs:
@@ -19,17 +19,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply V0.5.1 strict full-lobby safety fix
+      - name: Apply V0.5.2 prediction refresh race fix
         run: |
-          python3 ci/v052/fix.py
+          python3 ci/v054/fix.py
           git diff --check
-          grep -q "RaceTapPolicy.intervalMs(now, predictedSpawnAt)" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          ! grep -q "MAX_DIRECT_TARGET_TAPS" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "triggerPredictionListRefresh" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "PredictionRefreshPolicy.shouldRefresh" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          ! grep -q "tryBlindListTargetTap" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          ! grep -q "listTargetTapX" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
+          grep -q "tryBlindMapTargetTap" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "MushroomLobbyPolicy.canJoin" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "prepareFullLobbyRecovery" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "MAX_JOIN_TAP_ATTEMPTS = 2" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          grep -q "listTargetStandby" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          grep -q "MushroomReachability.isOutOfRangeText" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
           grep -q "GestureResultCallback" app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
 
       - name: Set up Java 17
@@ -64,21 +65,23 @@ jobs:
           AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)
           "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
           grep -q "package: name='com.example.pikminhelper'" /tmp/badging.txt
-          grep -q "versionName='0.5.1'" /tmp/badging.txt
+          grep -q "versionCode='20'" /tmp/badging.txt
+          grep -q "versionName='0.5.2'" /tmp/badging.txt
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)
-          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          "$APKSIGNER" verify --verbose --print-certs "$APK" | tee /tmp/apksigner.txt
+          grep -q "certificate SHA-256 digest: 69f7f0545e13727a7923071d68d3563d1ad955b67bf2891198a9fa6e300caf82" /tmp/apksigner.txt
 
-      - name: Commit consolidated V0.5.1 service source
+      - name: Commit consolidated V0.5.2 service source
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app/src/main/java/com/example/pikminhelper/automation/AutonomousRaceServiceV4.kt
-          git diff --cached --quiet || git commit -m "Consolidate V0.5.1 strict full-lobby skip [skip ci]"
+          git diff --cached --quiet || git commit -m "Consolidate V0.5.2 prediction refresh race state machine [skip ci]"
           git push
 
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: MushroomHelper-v0.5.1
+          name: MushroomHelper-v0.5.2
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
