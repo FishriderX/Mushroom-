@@ -1,0 +1,200 @@
+    private fun findMapBadges(bitmap: Bitmap, lines: List<Text.Line>): List<MapBadge> {
+        val out = ArrayList<MapBadge>()
+        val minY = (bitmap.height * 0.02f).toInt()
+        val maxY = (bitmap.height * 0.88f).toInt()
+        lines.forEach { line ->
+            val text = clean(line.text)
+            if (!MAP_COUNT_REGEX.matches(text)) return@forEach
+            val count = text.toIntOrNull() ?: return@forEach
+            if (count !in 0..99) return@forEach
+            val box = line.boundingBox ?: return@forEach
+            if (box.centerY() !in minY..maxY) return@forEach
+            if (!hasTealParticipantBadge(bitmap, box)) return@forEach
+            val x = (box.centerX() - bitmap.width * 0.018f)
+                .coerceIn(4f, bitmap.width - 5f)
+            val y = (box.bottom + bitmap.height * 0.030f)
+                .coerceIn(4f, bitmap.height - 5f)
+            val key = mapPointKey(x, y, bitmap.width, bitmap.height)
+            out.add(MapBadge(count, x, y, key))
+        }
+        return out
+    }
+    private fun hasTealParticipantBadge(bitmap: Bitmap, box: Rect): Boolean {
+        val padX = max(20, bitmap.width / 28)
+        val padY = max(8, bitmap.height / 160)
+        val left = max(0, box.left - padX)
+        val right = min(bitmap.width, box.right + padX / 2)
+        val top = max(0, box.top - padY)
+        val bottom = min(bitmap.height, box.bottom + padY)
+        if (right <= left || bottom <= top) return false
+        var total = 0
+        var teal = 0
+        var y = top
+        while (y < bottom) {
+            var x = left
+            while (x < right) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                if (
+                    g in 70..195 &&
+                    b in 55..175 &&
+                    r < 125 &&
+                    g > r + 12 &&
+                    g >= b - 35
+                ) teal++
+                total++
+                x += 3
+            }
+            y += 3
+        }
+        return total > 0 && teal.toFloat() / total >= 0.10f
+    }
+    private fun findUnbadgedMushroomCandidates(
+        bitmap: Bitmap,
+        badges: List<MapBadge>
+    ): List<MapCandidate> {
+        val out = ArrayList<MapCandidate>()
+        val step = max(5, bitmap.width / 180)
+        val cell = max(28, bitmap.width / 24)
+        val minY = (bitmap.height * 0.03f).toInt()
+        val maxY = (bitmap.height * 0.84f).toInt()
+        var cy = minY + cell / 2
+        while (cy < maxY - cell) {
+            var cx = cell / 2
+            while (cx < bitmap.width - cell / 2) {
+                val capScore = mushroomPatchScore(bitmap, cx, cy, cell, step)
+                if (capScore >= MIN_MUSHROOM_PATCH_SCORE) {
+                    val tapX = cx.toFloat()
+                    val tapY = (cy + cell * 0.35f).coerceAtMost(bitmap.height - 5f)
+                    val nearKnownBadge = badges.any { badge ->
+                        val dx = badge.x - tapX
+                        val dy = badge.y - tapY
+                        dx * dx + dy * dy < (cell * 1.9f) * (cell * 1.9f)
+                    }
+                    if (!nearKnownBadge) {
+                        val key = mapPointKey(tapX, tapY, bitmap.width, bitmap.height)
+                        if (!isMapPointRejected(key) && out.none { sameMapArea(it.x, it.y, tapX, tapY, cell) }) {
+                            out.add(
+                                MapCandidate(
+                                    x = tapX,
+                                    y = tapY,
+                                    key = key,
+                                    participantCount = 0,
+                                    score = capScore
+                                )
+                            )
+                        }
+                    }
+                }
+                cx += cell
+            }
+            cy += cell
+        }
+        return out
+    }
+    private fun mushroomPatchScore(
+        bitmap: Bitmap,
+        cx: Int,
+        cy: Int,
+        cell: Int,
+        step: Int
+    ): Int {
+        val left = max(0, cx - cell / 2)
+        val right = min(bitmap.width, cx + cell / 2)
+        val top = max(0, cy - cell / 3)
+        val mid = min(bitmap.height, cy + cell / 5)
+        val bottom = min(bitmap.height, cy + cell)
+        var red = 0
+        var yellow = 0
+        var pale = 0
+        var y = top
+        while (y < mid) {
+            var x = left
+            while (x < right) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                if (r > 185 && r > g + 35 && b < 155) red++
+                if (r > 195 && g > 145 && b < 135 && abs(r - g) < 105) yellow++
+                x += step
+            }
+            y += step
+        }
+        y = mid
+        while (y < bottom) {
+            var x = left
+            while (x < right) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                if (r > 170 && g > 145 && b > 95 && max(r, max(g, b)) - min(r, min(g, b)) < 115) {
+                    pale++
+                }
+                x += step
+            }
+            y += step
+        }
+        if (red < 3 || yellow < 1 || pale < 3) return 0
+        return red * 5 + yellow * 3 + pale
+    }
+    private fun sameMapArea(
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        radius: Int
+    ): Boolean {
+        val dx = x1 - x2
+        val dy = y1 - y2
+        return dx * dx + dy * dy < radius.toFloat() * radius.toFloat()
+    }
+    private fun estimateMapGreenRatio(bitmap: Bitmap): Float {
+        var green = 0
+        var total = 0
+        val stepX = max(8, bitmap.width / 45)
+        val stepY = max(8, bitmap.height / 60)
+        val yMax = (bitmap.height * 0.88f).toInt()
+        var y = 0
+        while (y < yMax) {
+            var x = 0
+            while (x < bitmap.width) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                if (g > 105 && g > r * 1.05f && g > b * 1.05f) green++
+                total++
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (total == 0) 0f else green.toFloat() / total
+    }
+    private fun mapPointKey(x: Float, y: Float, width: Int, height: Int): Int {
+        val qx = (x / max(1f, width / 24f)).toInt().coerceIn(0, 31)
+        val qy = (y / max(1f, height / 32f)).toInt().coerceIn(0, 63)
+        return qy * 64 + qx
+    }
+    private fun blacklistLastBirdMapPoint() {
+        val key = lastBirdMapTapKey ?: return
+        rejectedBirdMapPoints[key] = SystemClock.elapsedRealtime() + MAP_REJECT_MS
+    }
+    private fun isMapPointRejected(key: Int): Boolean {
+        val until = rejectedBirdMapPoints[key] ?: return false
+        if (SystemClock.elapsedRealtime() >= until) {
+            rejectedBirdMapPoints.remove(key)
+            return false
+        }
+        return true
+    }
+    private fun cleanupRejectedMapPoints() {
+        val now = SystemClock.elapsedRealtime()
+        rejectedBirdMapPoints.entries.removeIf { it.value <= now }
+    }
+    private fun estimateListParticipantCount(bitmap: Bitmap, titleLine: Text.Line): Int? {
+        val box = titleLine.boundingBox ?: return null
+        val left = max(0, box.left - (bitmap.width * 0.01f).toInt())
