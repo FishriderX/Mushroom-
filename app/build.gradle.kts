@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.pikminhelper"
         minSdk = 30
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.4.0"
+        versionCode = 13
+        versionName = "0.4.1"
     }
 
     compileOptions {
