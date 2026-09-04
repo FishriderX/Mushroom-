@@ -329,6 +329,15 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val normalized = clean(entries.joinToString(" ") { it.text })
         updateDailyRemaining(normalized)
         if (isDoneForToday()) return true
+        if (containsFullLobby(normalized)) {
+            prepareFullLobbyRecovery()
+            findNode(entries, "關閉")?.let {
+                clickNode(it.node, 140)
+                return true
+            }
+            goBack(140)
+            return true
+        }
         if (containsTicketWarning(normalized) || containsJoinFailure(normalized)) {
             prepareFailureRecovery()
             findNode(entries, "關閉")?.let {
@@ -445,7 +454,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return true
         }
         val participantCount = extractParticipantCountFromText(normalized)
-        if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+        if (participantCount == null) {
+            // Unity often does not expose avatar rows as accessibility nodes.
+            // Do not click Join on an unknown count; let OCR/image verification
+            // make the final safety decision instead.
+            return false
+        }
+        if (!MushroomLobbyPolicy.canJoin(participantCount, FREE_SLOT_LIMIT)) {
+            markCurrentTargetBlocked(FULL_OR_UNKNOWN_POSITION_CACHE_MS)
             rejectDetailAndAdvance()
             return true
         }
@@ -765,6 +781,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val normalized = clean(result.text)
         updateDailyRemaining(normalized)
         if (isDoneForToday()) return
+        if (containsFullLobby(normalized)) {
+            prepareFullLobbyRecovery()
+            findOcrLine(lines, "關閉")?.let {
+                tapOcrButton(frame, it, 140)
+            } ?: goBack(140)
+            return
+        }
         if (containsTicketWarning(normalized) || containsJoinFailure(normalized)) {
             prepareFailureRecovery()
             findOcrLine(lines, "關閉")?.let {
@@ -896,7 +919,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val participantCount =
             extractParticipantCountFromText(normalized)
                 ?: estimateDetailParticipantCount(frame.bitmap, lines)
-        if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+        if (!MushroomLobbyPolicy.canJoin(participantCount, FREE_SLOT_LIMIT)) {
+            markCurrentTargetBlocked(FULL_OR_UNKNOWN_POSITION_CACHE_MS)
             rejectDetailAndAdvance()
             return
         }
@@ -989,6 +1013,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (target != null) {
             val participantCount = estimateListParticipantCount(frame.bitmap, target)
             if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+                position?.first?.let { markListPositionBlocked(it, FULL_OR_UNKNOWN_POSITION_CACHE_MS) }
                 if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
                     advanceSearchPhaseAndRefresh()
                 } else {
@@ -2145,6 +2170,20 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         autoTapAttempts = 0
         goBack(200)
     }
+    private fun prepareFullLobbyRecovery() {
+        if (detailCameFromBirdMap) blacklistLastBirdMapPoint()
+        markCurrentTargetBlocked(FULL_OR_UNKNOWN_POSITION_CACHE_MS)
+        detailCameFromBirdMap = false
+        lastBirdMapTapKey = null
+        // One back step is enough after the optional dialog is dismissed.
+        // Do not run the slower generic two-step refresh path for an old full lobby.
+        backOutStepsRemaining = 1
+        forceAdvanceOnList = true
+        refreshPending = false
+        autoTapAttempts = 0
+        joinTapAttempts = 0
+    }
+
     private fun prepareFailureRecovery() {
         if (detailCameFromBirdMap) blacklistLastBirdMapPoint()
         detailCameFromBirdMap = false
@@ -2186,12 +2225,18 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         return false
     }
 
-    private fun markCurrentTargetUnreachable() {
-        val position = detailSourceListPosition
+    private fun markListPositionBlocked(position: Int, ttlMs: Long) {
         if (position > 0) {
-            unreachableListPositions[position] =
-                SystemClock.elapsedRealtime() + OUT_OF_RANGE_POSITION_CACHE_MS
+            unreachableListPositions[position] = SystemClock.elapsedRealtime() + ttlMs
         }
+    }
+
+    private fun markCurrentTargetBlocked(ttlMs: Long) {
+        markListPositionBlocked(detailSourceListPosition, ttlMs)
+    }
+
+    private fun markCurrentTargetUnreachable() {
+        markCurrentTargetBlocked(OUT_OF_RANGE_POSITION_CACHE_MS)
     }
 
     private fun isListPositionUnreachable(position: Int): Boolean {
@@ -2267,12 +2312,17 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             normalized.contains("新增票券") ||
             normalized.contains("蘑菇儲值券不足")
     }
-    private fun containsJoinFailure(normalized: String): Boolean {
+    private fun containsFullLobby(normalized: String): Boolean {
         return normalized.contains("人數已滿") ||
+            normalized.contains("參加人數已滿") ||
+            normalized.contains("已達人數上限")
+    }
+
+    private fun containsJoinFailure(normalized: String): Boolean {
+        return containsFullLobby(normalized) ||
             normalized.contains("已達上限") ||
             normalized.contains("無法參加") ||
-            normalized.contains("無法加入") ||
-            normalized.contains("參加人數已滿")
+            normalized.contains("無法加入")
     }
     private fun isMushroomList(normalized: String): Boolean =
         ExploreScreenRules.isMushroomList(normalized)
@@ -2471,7 +2521,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val MAX_STUCK_LIST_POSITION = 2
         private const val MAX_REWIND_SWIPES = 18
         private const val MAX_AUTO_TAP_ATTEMPTS = 5
-        private const val MAX_JOIN_TAP_ATTEMPTS = 4
+        private const val MAX_JOIN_TAP_ATTEMPTS = 2
         private const val MAX_NODE_VISITS = 180
         private const val MAX_CHILDREN_PER_NODE = 40
         private const val OCR_MAX_WIDTH = 900
@@ -2480,6 +2530,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val POST_JOIN_REFRESH_MS = 900L
         private const val MAP_REJECT_MS = 30_000L
         private const val OUT_OF_RANGE_POSITION_CACHE_MS = 5L * 60L * 1000L
+        private const val FULL_OR_UNKNOWN_POSITION_CACHE_MS = 30_000L
         private const val MIN_MUSHROOM_PATCH_SCORE = 32
         private const val LIST_BUSY_RETRY_MS = 140L
         private const val LIST_PROGRESS_GUARD_MS = 900L
