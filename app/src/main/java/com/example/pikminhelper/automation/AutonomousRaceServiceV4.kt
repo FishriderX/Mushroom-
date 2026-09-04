@@ -68,6 +68,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     @Volatile private var etaInspectionCurrentPosition = -1
     @Volatile private var etaInspectionCount = 0
     @Volatile private var nextEtaInspectionAt = 0L
+    @Volatile private var timingCensusRequired = true
+    @Volatile private var timingCensusCompletedAt = 0L
     @Volatile private var predictedFinishAt = 0L
     @Volatile private var predictedSpawnAt = 0L
     @Volatile private var predictionReadyAt = 0L
@@ -1001,10 +1003,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         // A genuine Pikmin list mutation outranks whatever old scan was doing.
         // Stop inspection/patrol, return to card 1 if needed, then run a fresh
         // priority search immediately.
-        if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby) {
+        if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby && !etaInspectionActive) {
             urgentListChange = false
-            etaInspectionActive = false
-            etaInspectionAdvancePending = false
             parkedAtStart = false
             phase = firstPhase()
             raceSweepActive = true
@@ -1022,6 +1022,31 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
 
         if (etaInspectionActive) {
+            handleEtaInspectionList(frame, lines, reachedEnd, position)
+            return
+        }
+
+        if (
+            prefs.mode == RunMode.RACE &&
+            timingCensusRequired &&
+            predictedSpawnAt <= 0L &&
+            !predictionRefreshPending &&
+            !targetMapLockActive &&
+            !targetMapLockPending
+        ) {
+            val atStart = position?.first == 1 || (position == null && listSwipeCount == 0)
+            if (!atStart) {
+                beginRewind(RewindResume.INSPECT)
+                return
+            }
+            etaInspectionActive = true
+            etaInspectionAdvancePending = false
+            etaInspectionCurrentWasLast = false
+            etaInspectionCurrentPosition = -1
+            etaInspectionCount = 0
+            listSwipeCount = 0
+            lastListPosition = position?.first ?: -1
+            stuckListPositionCount = 0
             handleEtaInspectionList(frame, lines, reachedEnd, position)
             return
         }
@@ -1219,6 +1244,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             etaInspectionCurrentWasLast = reachedEnd
             etaInspectionCount++
             listProgressGeneration++
+            listContextActive = false
+            suppressListMutationEventsUntil =
+                SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS
             tapOcrButton(frame, title, ETA_DETAIL_OPEN_COOLDOWN_MS)
             return
         }
@@ -1452,6 +1480,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         etaInspectionAdvancePending = true
         listContextActive = false
+        suppressListMutationEventsUntil =
+            SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS
         goBack(ETA_DETAIL_BACK_COOLDOWN_MS)
     }
 
@@ -1475,11 +1505,16 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         etaInspectionCurrentWasLast = false
         etaInspectionCurrentPosition = -1
         etaInspectionCount = 0
-        nextEtaInspectionAt = SystemClock.elapsedRealtime() + ETA_REINSPECTION_MS
+        val now = SystemClock.elapsedRealtime()
+        timingCensusCompletedAt = now
+        timingCensusRequired = false
+        nextEtaInspectionAt = now + ETA_REINSPECTION_MS
         phase = firstPhase()
         if (predictedSpawnAt > 0L && predictedSourcePosition > 0) {
             beginRewind(RewindResume.TARGET)
         } else {
+            timingCensusRequired = true
+            nextEtaInspectionAt = now + ETA_FAILED_RETRY_MS
             beginRewind(RewindResume.PARK)
         }
     }
@@ -1509,8 +1544,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return
         }
 
+        if (prefs.mode == RunMode.RACE && predictedSpawnAt <= 0L && now >= nextEtaInspectionAt) {
+            timingCensusRequired = true
+            scheduleFreshListScan(180L)
+            return
+        }
+
         val delay = when (prefs.mode) {
-            RunMode.RACE -> RACE_BACKUP_SWEEP_MS
+            RunMode.RACE -> min(RACE_BACKUP_SWEEP_MS, (nextEtaInspectionAt - now).coerceAtLeast(500L))
             RunMode.WATCH -> 8_000L
             RunMode.ECO -> 30_000L
         }
@@ -2202,6 +2243,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         etaInspectionAdvancePending = false
         etaInspectionCount = 0
         nextEtaInspectionAt = 0L
+        timingCensusRequired = true
+        timingCensusCompletedAt = 0L
         clearPrediction()
         unreachableListPositions.clear()
         detailSourceListPosition = -1
@@ -2309,6 +2352,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         etaInspectionAdvancePending = true
         listContextActive = false
+        suppressListMutationEventsUntil =
+            SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS
         goBack(ETA_DETAIL_BACK_COOLDOWN_MS)
     }
 
@@ -2353,6 +2398,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             etaInspectionAdvancePending = false
             etaInspectionCount = 0
             nextEtaInspectionAt = 0L
+            timingCensusRequired = true
+            timingCensusCompletedAt = 0L
             clearPrediction()
             unreachableListPositions.clear()
             detailSourceListPosition = -1
@@ -2608,6 +2655,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val ETA_INSPECTION_SWIPE_COOLDOWN_MS = 210L
         private const val ETA_DETAIL_OPEN_COOLDOWN_MS = 220L
         private const val ETA_DETAIL_BACK_COOLDOWN_MS = 180L
+        private const val ETA_TRANSITION_EVENT_SUPPRESS_MS = 900L
+        private const val ETA_FAILED_RETRY_MS = 15_000L
         private const val TARGET_CARD_RETRY_MS = 220L
         private const val TARGET_MAP_OPEN_COOLDOWN_MS = 300L
         private const val TARGET_MAP_BUTTON_RETRY_MS = 180L
