@@ -1,0 +1,200 @@
+        val right = min(bitmap.width, box.left + (bitmap.width * 0.60f).toInt())
+        val top = min(bitmap.height - 1, box.bottom + (bitmap.height * 0.024f).toInt())
+        val bottom = min(bitmap.height, box.bottom + (bitmap.height * 0.090f).toInt())
+        if (right <= left || bottom <= top) return null
+        return countColorClusters(bitmap, left, top, right, bottom)
+            ?.takeIf { it in 1..8 }
+    }
+    private fun estimateDetailParticipantCount(
+        bitmap: Bitmap,
+        lines: List<Text.Line>
+    ): Int? {
+        val left = (bitmap.width * 0.04f).toInt()
+        val right = (bitmap.width * 0.82f).toInt()
+        val top = (bitmap.height * 0.80f).toInt()
+        val bottom = (bitmap.height * 0.95f).toInt()
+        countColorClusters(bitmap, left, top, right, bottom)?.let {
+            if (it in 1..8) return it
+        }
+        val nameXs = mutableListOf<Int>()
+        val minY = (bitmap.height * 0.84f).toInt()
+        val maxY = (bitmap.height * 0.995f).toInt()
+        lines.forEach { line ->
+            val box = line.boundingBox ?: return@forEach
+            if (box.centerY() !in minY..maxY) return@forEach
+            val s = clean(line.text)
+            if (s.isEmpty() || s.any { it.isDigit() } || s.length > 20) return@forEach
+            if (
+                s.contains("前往這裡") ||
+                s.contains("參加") ||
+                s.contains("蘑菇") ||
+                s.contains("關閉")
+            ) return@forEach
+            nameXs.add(box.centerX())
+        }
+        if (nameXs.isEmpty()) return null
+        nameXs.sort()
+        var groups = 0
+        var last = Int.MIN_VALUE
+        val minGap = max(20, bitmap.width / 14)
+        for (x in nameXs) {
+            if (last == Int.MIN_VALUE || x - last >= minGap) {
+                groups++
+                last = x
+            }
+        }
+        return groups.takeIf { it in 1..8 }
+    }
+    private fun countColorClusters(
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ): Int? {
+        if (left < 0 || top < 0 || right > bitmap.width || bottom > bitmap.height) return null
+        if (right - left < 30 || bottom - top < 20) return null
+        val width = right - left
+        val columnScore = IntArray(width)
+        val yStep = 3
+        var x = left
+        while (x < right) {
+            var y = top
+            var score = 0
+            while (y < bottom) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                val hi = max(r, max(g, b))
+                val lo = min(r, min(g, b))
+                if (hi > 65 && hi - lo > 28 && !(r > 235 && g > 235 && b > 235)) score++
+                y += yStep
+            }
+            columnScore[x - left] = score
+            x += 2
+        }
+        val threshold = max(3, (bottom - top) / 30)
+        var groups = 0
+        var inGroup = false
+        var groupStart = 0
+        var gap = 0
+        val minGroupWidth = max(10, bitmap.width / 90)
+        val maxGap = max(4, bitmap.width / 270)
+        var i = 0
+        while (i < width) {
+            val active = columnScore[i] >= threshold
+            if (active) {
+                if (!inGroup) {
+                    inGroup = true
+                    groupStart = i
+                }
+                gap = 0
+            } else if (inGroup) {
+                gap++
+                if (gap > maxGap) {
+                    val groupWidth = i - gap - groupStart
+                    if (groupWidth >= minGroupWidth) groups++
+                    inGroup = false
+                    gap = 0
+                }
+            }
+            i++
+        }
+        if (inGroup) {
+            val groupWidth = width - groupStart
+            if (groupWidth >= minGroupWidth) groups++
+        }
+        return groups.takeIf { it > 0 }
+    }
+    private fun frameFingerprint(bitmap: Bitmap): Long {
+        var hash = 1125899906842597L
+        val cols = 8
+        val rows = 10
+        val yStart = (bitmap.height * 0.08f).toInt()
+        val yEnd = (bitmap.height * 0.94f).toInt().coerceAtMost(bitmap.height - 1)
+        for (ry in 0 until rows) {
+            val y = yStart + ((yEnd - yStart) * ry / max(1, rows - 1))
+            for (rx in 0 until cols) {
+                val x = (bitmap.width - 1) * rx / max(1, cols - 1)
+                val c = bitmap.getPixel(x, y)
+                val qr = Color.red(c) shr 4
+                val qg = Color.green(c) shr 4
+                val qb = Color.blue(c) shr 4
+                hash = hash * 31L + ((qr shl 8) or (qg shl 4) or qb)
+            }
+        }
+        return hash
+    }
+    private fun extractParticipantCountFromText(value: String): Int? {
+        val s = clean(value)
+        PARTICIPANT_REGEXES.forEach { regex ->
+            val match = regex.find(s) ?: return@forEach
+            val count = match.groupValues.getOrNull(1)?.toIntOrNull()
+            if (count != null && count in 0..99) return count
+        }
+        return null
+    }
+    private fun findOcrLine(lines: List<Text.Line>, needle: String): Text.Line? {
+        val n = clean(needle)
+        return lines.firstOrNull { clean(it.text).contains(n) }
+    }
+    private fun findExactOcrLine(lines: List<Text.Line>, needle: String): Text.Line? {
+        val n = clean(needle)
+        return lines.firstOrNull { clean(it.text) == n }
+    }
+    private fun tapOcrButton(frame: OcrFrame, line: Text.Line, cooldownMs: Long) {
+        val box = line.boundingBox ?: return
+        verifiedTap(
+            box.exactCenterX() * frame.scaleX,
+            box.exactCenterY() * frame.scaleY,
+            cooldownMs
+        )
+    }
+    private fun tapSelectionFallback(button: SelectionButton, cooldownMs: Long) {
+        val dm = resources.displayMetrics
+        when (button) {
+            SelectionButton.AUTO -> verifiedTap(
+                dm.widthPixels * 0.255f,
+                dm.heightPixels * 0.405f,
+                cooldownMs
+            )
+            SelectionButton.GO -> verifiedTap(
+                dm.widthPixels * 0.855f,
+                dm.heightPixels * 0.895f,
+                cooldownMs
+            )
+        }
+    }
+    private fun firstPhase(): SearchPhase =
+        if (isWeekend()) SearchPhase.GIANT else SearchPhase.EVENT
+    private fun advanceSearchPhaseAndRefresh() {
+        phase = when {
+            isWeekend() && phase == SearchPhase.GIANT -> SearchPhase.EVENT
+            isWeekend() -> SearchPhase.GIANT
+            phase == SearchPhase.EVENT -> SearchPhase.ANY
+            else -> SearchPhase.EVENT
+        }
+        listSwipeCount = 0
+        lastListPosition = -1
+        stuckListPositionCount = 0
+        forceAdvanceOnList = false
+        refreshPending = true
+        reopenExploreAt = SystemClock.elapsedRealtime() + refreshDelayMs()
+        goBack(220)
+    }
+    private fun markJoinSubmission() {
+        listSwipeCount = 0
+        lastListPosition = -1
+        stuckListPositionCount = 0
+        forceAdvanceOnList = false
+        refreshPending = true
+        reopenExploreAt = SystemClock.elapsedRealtime() + POST_JOIN_REFRESH_MS
+        phase = firstPhase()
+        detailCameFromBirdMap = false
+        lastBirdMapTapKey = null
+    }
+    private fun rejectDetailAndAdvance() {
+        if (detailCameFromBirdMap) {
+            blacklistLastBirdMapPoint()
+            detailCameFromBirdMap = false
