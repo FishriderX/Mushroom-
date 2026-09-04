@@ -39,6 +39,10 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
     }
     private val ocrBusy = AtomicBoolean(false)
+    private val fastMapBusy = AtomicBoolean(false)
+    @Volatile private var lastFastMapScreenshotAt = 0L
+    @Volatile private var fastMapBaselineReady = false
+    @Volatile private var fastMapBaselineKeys: Set<Int> = emptySet()
     @Volatile private var nextActionAt = 0L
     @Volatile private var lastOcrAt = 0L
     @Volatile private var burstUntil = 0L
@@ -262,12 +266,22 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (!prefs.enabled) return
         val now = SystemClock.elapsedRealtime()
         updatePredictionState(now)
-        if (now < nextActionAt) return
         if (prefs.pauseLowBattery && batteryPct() < 20) return
         resetDailyStopIfNeeded()
         if (isDoneForToday()) return
         val root = rootInActiveWindow ?: return
         if (root.packageName?.toString() != PIKMIN_PACKAGE) return
+
+        // Bird-view RACE never waits for whole-screen Chinese OCR. Android
+        // limits Accessibility screenshots to roughly one every 333 ms, so
+        // this path polls at a safe 350 ms cadence and performs only local
+        // pixel analysis around the locked mushroom location.
+        if (targetMapLockActive && isPredictionPrewarm(now)) {
+            requestTargetMapFastFrame()
+            return
+        }
+
+        if (now < nextActionAt) return
         if (handleAccessibilityTree(root)) return
         requestOcrFallback()
     }
@@ -439,6 +453,197 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             verifiedTap(bounds.exactCenterX(), bounds.exactCenterY(), cooldownMs)
         }
     }
+    private fun requestTargetMapFastFrame() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastFastMapScreenshotAt < FAST_MAP_SCREENSHOT_INTERVAL_MS) return
+        if (!fastMapBusy.compareAndSet(false, true)) return
+        lastFastMapScreenshotAt = now
+
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            imageExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(result: ScreenshotResult) {
+                    val hw = result.hardwareBuffer
+                    val wrapped = Bitmap.wrapHardwareBuffer(hw, result.colorSpace)
+                    val bitmap = wrapped?.copy(Bitmap.Config.ARGB_8888, false)
+                    hw.close()
+                    if (bitmap == null) {
+                        fastMapBusy.set(false)
+                        scheduleFastMapRetry(FAST_MAP_FAILURE_RETRY_MS)
+                        return
+                    }
+
+                    val handled = handleFastTargetMapBitmap(bitmap)
+                    bitmap.recycle()
+                    fastMapBusy.set(false)
+                    if (!handled) scheduleFastMapRetry(FAST_MAP_LOOP_DELAY_MS)
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    fastMapBusy.set(false)
+                    val delay = if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT)
+                        FAST_MAP_SHORT_INTERVAL_RETRY_MS
+                    else
+                        FAST_MAP_FAILURE_RETRY_MS
+                    scheduleFastMapRetry(delay)
+                }
+            }
+        )
+    }
+
+    private fun scheduleFastMapRetry(delayMs: Long) {
+        if (!prefs.enabled || !targetMapLockActive) return
+        // Do not use the normal list watchdog here; it is intentionally
+        // disabled while the race surface is bird view.
+        main.removeCallbacks(eventKick)
+        main.postDelayed(eventKick, delayMs)
+    }
+
+    private fun handleFastTargetMapBitmap(bitmap: Bitmap): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (!targetMapLockActive || !isPredictionPrewarm(now)) return false
+
+        if (!targetMapAnchorReady) {
+            targetMapAnchorX = bitmap.width * TARGET_MAP_CENTER_X
+            targetMapAnchorY = bitmap.height * TARGET_MAP_CENTER_Y
+            targetMapAnchorReady = true
+        }
+
+        val candidates = findFastTargetCandidates(bitmap)
+
+        // The first prewarm frame becomes the empty-map baseline. Normally this
+        // is captured about 30 seconds before respawn, long after the old
+        // mushroom disappeared. If timing drift means we are already at/after
+        // predicted spawn, do not baseline away a visible candidate.
+        if (!fastMapBaselineReady) {
+            if (now < predictedSpawnAt && candidates.isNotEmpty()) {
+                fastMapBaselineKeys = candidates.map { it.key }.toSet()
+                fastMapBaselineReady = true
+                return false
+            }
+            if (now < predictedSpawnAt) {
+                fastMapBaselineKeys = emptySet()
+                fastMapBaselineReady = true
+                return false
+            }
+            fastMapBaselineReady = true
+        }
+
+        val best = candidates
+            .filterNot { fastMapBaselineKeys.contains(it.key) }
+            .filterNot { isMapPointRejected(it.key) }
+            .maxByOrNull { it.score }
+            ?: return false
+
+        detailCameFromBirdMap = true
+        lastBirdMapTapKey = best.key
+        verifiedTap(best.x, best.y, RACE_TARGET_TAP_COOLDOWN_MS)
+        return true
+    }
+
+    private fun findFastTargetCandidates(bitmap: Bitmap): List<MapCandidate> {
+        val out = ArrayList<MapCandidate>()
+        val cell = max(36, bitmap.width / 22)
+        val xRadius = (bitmap.width * FAST_MAP_X_RADIUS).toInt()
+        val yRadius = (bitmap.height * FAST_MAP_Y_RADIUS).toInt()
+        val left = max(cell / 2, targetMapAnchorX.toInt() - xRadius)
+        val right = min(bitmap.width - cell / 2, targetMapAnchorX.toInt() + xRadius)
+        val top = max(cell / 2, targetMapAnchorY.toInt() - yRadius)
+        val bottom = min(bitmap.height - cell / 2, targetMapAnchorY.toInt() + yRadius)
+        val stride = max(cell / 3, 14)
+
+        var cy = top
+        while (cy <= bottom) {
+            var cx = left
+            while (cx <= right) {
+                val score = fastTargetPatchScore(bitmap, cx, cy, cell)
+                if (score >= FAST_MAP_MIN_PATCH_SCORE) {
+                    val tapX = cx.toFloat()
+                    val tapY = (cy + cell * 0.28f).coerceAtMost(bitmap.height - 4f)
+                    val key = mapPointKey(tapX, tapY, bitmap.width, bitmap.height)
+                    val dx = (tapX - targetMapAnchorX) / bitmap.width
+                    val dy = (tapY - targetMapAnchorY) / bitmap.height
+                    val proximityPenalty = ((dx * dx + dy * dy) * 42_000f).toInt()
+                    out.add(
+                        MapCandidate(
+                            x = tapX,
+                            y = tapY,
+                            key = key,
+                            participantCount = null,
+                            score = score - proximityPenalty
+                        )
+                    )
+                }
+                cx += stride
+            }
+            cy += stride
+        }
+
+        return out
+            .sortedByDescending { it.score }
+            .fold(ArrayList()) { acc, c ->
+                if (acc.none { sameMapArea(it.x, it.y, c.x, c.y, cell) }) acc.add(c)
+                acc
+            }
+    }
+
+    private fun fastTargetPatchScore(bitmap: Bitmap, cx: Int, cy: Int, cell: Int): Int {
+        val left = max(0, cx - cell / 2)
+        val right = min(bitmap.width, cx + cell / 2)
+        val top = max(0, cy - cell / 2)
+        val capBottom = min(bitmap.height, cy + cell / 8)
+        val bottom = min(bitmap.height, cy + cell)
+        val step = max(2, cell / 14)
+
+        var vividCap = 0
+        var brightCap = 0
+        var paleStem = 0
+        var warmStem = 0
+
+        var y = top
+        while (y < capBottom) {
+            var x = left
+            while (x < right) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                val hi = max(r, max(g, b))
+                val lo = min(r, min(g, b))
+                val saturatedNonMapGreen =
+                    hi > 125 && hi - lo > 48 && !(g > r + 35 && g > b + 25)
+                if (saturatedNonMapGreen) vividCap++
+                if (r > 205 && g > 195 && b > 170 && hi - lo < 65) brightCap++
+                x += step
+            }
+            y += step
+        }
+
+        y = capBottom
+        while (y < bottom) {
+            var x = left
+            while (x < right) {
+                val c = bitmap.getPixel(x, y)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
+                val hi = max(r, max(g, b))
+                val lo = min(r, min(g, b))
+                if (hi > 145 && hi - lo < 92) paleStem++
+                if (r > 135 && g > 95 && b < 120 && r >= g) warmStem++
+                x += step
+            }
+            y += step
+        }
+
+        val cap = vividCap + brightCap
+        val stem = paleStem + warmStem
+        if (cap < 5 || stem < 3) return 0
+        return vividCap * 6 + brightCap * 3 + paleStem * 2 + warmStem * 2
+    }
+
     private fun requestOcrFallback() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val now = SystemClock.elapsedRealtime()
@@ -565,6 +770,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                 targetMapLockPending = false
                 targetMapLockActive = true
                 targetMapAnchorReady = false
+                fastMapBaselineReady = false
+                fastMapBaselineKeys = emptySet()
+                lastFastMapScreenshotAt = 0L
                 targetMapOpenAttempts = 0
             }
             handleBirdMap(frame, lines)
@@ -1077,6 +1285,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetMapAnchorReady = false
         targetMapAnchorX = 0f
         targetMapAnchorY = 0f
+        fastMapBaselineReady = false
+        fastMapBaselineKeys = emptySet()
+        lastFastMapScreenshotAt = 0L
     }
 
     private fun updateListPositionAndCheckEnd(position: Pair<Int, Int>?): Boolean {
@@ -1987,6 +2198,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         main.removeCallbacks(listWatchdogKick)
         main.removeCallbacksAndMessages(null)
         ocrBusy.set(false)
+        fastMapBusy.set(false)
         recognizer.close()
         if (imageThread.isAlive) imageThread.quitSafely()
         super.onDestroy()
@@ -2035,6 +2247,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val TARGET_MAP_IDLE_MIN_MS = 600L
         private const val TARGET_MAP_IDLE_MAX_MS = 2_000L
         private const val TARGET_MAP_RACE_POLL_MS = 120L
+        private const val FAST_MAP_SCREENSHOT_INTERVAL_MS = 350L
+        private const val FAST_MAP_SHORT_INTERVAL_RETRY_MS = 90L
+        private const val FAST_MAP_FAILURE_RETRY_MS = 180L
+        private const val FAST_MAP_LOOP_DELAY_MS = 24L
+        private const val FAST_MAP_MIN_PATCH_SCORE = 42
+        private const val FAST_MAP_X_RADIUS = 0.18f
+        private const val FAST_MAP_Y_RADIUS = 0.14f
         private const val MUSHROOM_RESPAWN_DELAY_MS = 5L * 60L * 1000L
         private const val PREDICTION_PREWARM_LEAD_MS = 30_000L
         private const val PREDICTION_AFTER_WINDOW_MS = 90_000L
