@@ -1,0 +1,194 @@
+            lastBirdMapTapKey = null
+            joinTapAttempts = 0
+            autoTapAttempts = 0
+            goBack(200)
+            return
+        }
+        forceAdvanceOnList = true
+        joinTapAttempts = 0
+        autoTapAttempts = 0
+        goBack(200)
+    }
+    private fun prepareFailureRecovery() {
+        if (detailCameFromBirdMap) blacklistLastBirdMapPoint()
+        detailCameFromBirdMap = false
+        lastBirdMapTapKey = null
+        backOutStepsRemaining = 2
+        forceAdvanceOnList = true
+        refreshPending = true
+        reopenExploreAt = SystemClock.elapsedRealtime() + refreshDelayMs()
+        autoTapAttempts = 0
+        joinTapAttempts = 0
+    }
+    private fun startBackOutToNextTarget(steps: Int) {
+        if (detailCameFromBirdMap) blacklistLastBirdMapPoint()
+        detailCameFromBirdMap = false
+        lastBirdMapTapKey = null
+        forceAdvanceOnList = true
+        refreshPending = true
+        reopenExploreAt = SystemClock.elapsedRealtime() + refreshDelayMs()
+        backOutStepsRemaining = steps.coerceAtLeast(1)
+        joinTapAttempts = 0
+        autoTapAttempts = 0
+        backOutStepsRemaining--
+        goBack(200)
+    }
+    private fun updateDailyRemaining(value: String) {
+        val match = DAILY_REMAINING_REGEX.find(clean(value)) ?: return
+        val remaining = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return
+        dailyRemaining = remaining
+        if (remaining <= 0) {
+            dailyDoneDate = LocalDate.now().toString()
+            nextActionAt = SystemClock.elapsedRealtime() + DAILY_DONE_RECHECK_MS
+        }
+    }
+    private fun isDoneForToday(): Boolean =
+        dailyRemaining == 0 && dailyDoneDate == LocalDate.now().toString()
+    private fun resetDailyStopIfNeeded() {
+        val today = LocalDate.now().toString()
+        if (dailyDoneDate != null && dailyDoneDate != today) {
+            dailyDoneDate = null
+            dailyRemaining = null
+            phase = firstPhase()
+            listSwipeCount = 0
+            lastListPosition = -1
+            stuckListPositionCount = 0
+            nextActionAt = 0L
+        }
+    }
+    private fun containsTicketWarning(normalized: String): Boolean {
+        return normalized.contains("沒有蘑菇儲值券") ||
+            normalized.contains("需要蘑菇儲值券") ||
+            normalized.contains("新增票券") ||
+            normalized.contains("蘑菇儲值券不足")
+    }
+    private fun containsJoinFailure(normalized: String): Boolean {
+        return normalized.contains("人數已滿") ||
+            normalized.contains("已達上限") ||
+            normalized.contains("無法參加") ||
+            normalized.contains("無法加入") ||
+            normalized.contains("參加人數已滿")
+    }
+    private fun isMushroomList(normalized: String): Boolean =
+        normalized.contains("今天還剩下") && normalized.contains("蘑菇")
+    private fun isDesiredForCurrentPhase(normalized: String): Boolean {
+        return when (phase) {
+            SearchPhase.GIANT -> normalized.contains("巨大")
+            SearchPhase.EVENT -> isEventText(normalized)
+            SearchPhase.ANY -> normalized.contains("蘑菇")
+        }
+    }
+    private fun isEventText(value: String): Boolean {
+        val s = clean(value)
+        return s.contains("華麗蘑菇") ||
+            s.contains("活動蘑菇") ||
+            s.contains("特殊活動")
+    }
+    private fun isWeekend(): Boolean = when (LocalDate.now().dayOfWeek) {
+        DayOfWeek.SATURDAY, DayOfWeek.SUNDAY -> true
+        else -> false
+    }
+    private fun clean(value: String): String = value.replace(Regex("\\s+"), "")
+    private fun swipeListReliable(cooldownMs: Long) {
+        if (!prefs.enabled) return
+        main.post {
+            if (!prefs.enabled) return@post
+            val root = rootInActiveWindow
+            val scrollable = root?.let { findListScrollable(it) }
+            if (scrollable != null && scrollable.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
+                return@post
+            }
+            val dm = resources.displayMetrics
+            val yRatio = if (listSwipeCount % 2 == 0) 0.70f else 0.74f
+            val path = Path().apply {
+                moveTo(dm.widthPixels * 0.82f, dm.heightPixels * yRatio)
+                lineTo(dm.widthPixels * 0.17f, dm.heightPixels * yRatio)
+            }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 230))
+                .build()
+            dispatchGesture(gesture, null, null)
+            nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
+        }
+    }
+    private fun findListScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        val screenH = resources.displayMetrics.heightPixels
+        while (queue.isNotEmpty() && visited < 120) {
+            val node = queue.removeFirst()
+            visited++
+            if (node.isScrollable) {
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                if (bounds.centerY() in (screenH * 0.44f).toInt()..(screenH * 0.91f).toInt()) {
+                    return node
+                }
+            }
+            val childCount = node.childCount.coerceAtMost(30)
+            for (i in 0 until childCount) {
+                node.getChild(i)?.let(queue::addLast)
+            }
+        }
+        return null
+    }
+    private fun verifiedTap(x: Float, y: Float, cooldownMs: Long) {
+        if (!prefs.enabled) return
+        main.post {
+            if (!prefs.enabled) return@post
+            val path = Path().apply { moveTo(x, y) }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 42))
+                .build()
+            dispatchGesture(gesture, null, null)
+            nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
+        }
+    }
+    private fun goBack(cooldownMs: Long) {
+        if (!prefs.enabled) return
+        main.post {
+            if (!prefs.enabled) return@post
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            nextActionAt = SystemClock.elapsedRealtime() + cooldownMs
+        }
+    }
+    private fun batteryPct(): Int {
+        val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
+        return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+    }
+    override fun onDestroy() {
+        main.removeCallbacksAndMessages(null)
+        ocrBusy.set(false)
+        recognizer.close()
+        if (imageThread.isAlive) imageThread.quitSafely()
+        super.onDestroy()
+    }
+    companion object {
+        private const val PIKMIN_PACKAGE = "com.nianticlabs.pikmin"
+        private const val FREE_SLOT_LIMIT = 5
+        private const val MAX_LIST_SWIPES = 18
+        private const val MAX_STUCK_LIST_POSITION = 2
+        private const val MAX_AUTO_TAP_ATTEMPTS = 5
+        private const val MAX_JOIN_TAP_ATTEMPTS = 4
+        private const val MAX_NODE_VISITS = 180
+        private const val MAX_CHILDREN_PER_NODE = 40
+        private const val OCR_MAX_WIDTH = 900
+        private const val EVENT_BURST_MS = 1_600L
+        private const val DAILY_DONE_RECHECK_MS = 60_000L
+        private const val POST_JOIN_REFRESH_MS = 900L
+        private const val MAP_REJECT_MS = 30_000L
+        private const val MIN_MUSHROOM_PATCH_SCORE = 32
+        private val FULL_TEAM_REGEX = Regex("(\\d{1,3})/\\1")
+        private val DAILY_REMAINING_REGEX = Regex("今天還剩下([0-9]{1,2})次")
+        private val LIST_POSITION_REGEX = Regex("蘑菇[:：]?([0-9]{1,2})/([0-9]{1,2})")
+        private val MAP_COUNT_REGEX = Regex("[0-9]{1,2}")
+        private val PARTICIPANT_REGEXES = listOf(
+            Regex("參加者?([0-9]{1,2})人"),
+            Regex("([0-9]{1,2})人參加"),
+            Regex("([0-9]{1,2})/5人?"),
+            Regex("目前([0-9]{1,2})人")
+        )
+    }
+}
