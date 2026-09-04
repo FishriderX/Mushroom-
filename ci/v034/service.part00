@@ -1,0 +1,200 @@
+package com.example.pikminhelper.automation
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.Path
+import android.graphics.Rect
+import android.os.BatteryManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.os.SystemClock
+import android.view.Display
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import com.example.pikminhelper.HelperPrefs
+import com.example.pikminhelper.RunMode
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import java.time.DayOfWeek
+import java.time.LocalDate
+import java.util.ArrayDeque
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+class AutonomousRaceServiceV4 : AccessibilityService() {
+    private lateinit var prefs: HelperPrefs
+    private val main = Handler(Looper.getMainLooper())
+    private val imageThread = HandlerThread("MushroomHelperV4Image")
+    private lateinit var imageHandler: Handler
+    private lateinit var imageExecutor: Executor
+    private val recognizer by lazy {
+        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+    }
+    private val ocrBusy = AtomicBoolean(false)
+    @Volatile private var nextActionAt = 0L
+    @Volatile private var lastOcrAt = 0L
+    @Volatile private var burstUntil = 0L
+    @Volatile private var lastFrameFingerprint = Long.MIN_VALUE
+    @Volatile private var lastProcessedFrameAt = 0L
+    @Volatile private var listSwipeCount = 0
+    @Volatile private var lastListPosition = -1
+    @Volatile private var stuckListPositionCount = 0
+    @Volatile private var forceAdvanceOnList = false
+    @Volatile private var refreshPending = false
+    @Volatile private var reopenExploreAt = 0L
+    @Volatile private var backOutStepsRemaining = 0
+    @Volatile private var autoTapAttempts = 0
+    @Volatile private var joinTapAttempts = 0
+    @Volatile private var dailyRemaining: Int? = null
+    @Volatile private var dailyDoneDate: String? = null
+    @Volatile private var phase: SearchPhase = SearchPhase.EVENT
+    @Volatile private var detailCameFromBirdMap = false
+    @Volatile private var lastBirdMapTapKey: Int? = null
+    private val rejectedBirdMapPoints = ConcurrentHashMap<Int, Long>()
+    private enum class SearchPhase { GIANT, EVENT, ANY }
+    private enum class SelectionButton { AUTO, GO }
+    private data class NodeEntry(
+        val node: AccessibilityNodeInfo,
+        val text: String,
+        val bounds: Rect
+    )
+    private data class OcrFrame(
+        val bitmap: Bitmap,
+        val scaleX: Float,
+        val scaleY: Float
+    )
+    private data class MapBadge(
+        val count: Int,
+        val x: Float,
+        val y: Float,
+        val key: Int
+    )
+    private data class MapCandidate(
+        val x: Float,
+        val y: Float,
+        val key: Int,
+        val participantCount: Int?,
+        val score: Int
+    )
+    private val loop = object : Runnable {
+        override fun run() {
+            scanOnce()
+            main.postDelayed(this, nodeIntervalMs())
+        }
+    }
+    private val eventKick = Runnable { scanOnce() }
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        prefs = HelperPrefs(this)
+        phase = firstPhase()
+        if (!imageThread.isAlive) imageThread.start()
+        imageHandler = Handler(imageThread.looper)
+        imageExecutor = Executor { command -> imageHandler.post(command) }
+        main.removeCallbacks(loop)
+        main.post(loop)
+    }
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!::prefs.isInitialized || !prefs.enabled) return
+        if (event?.packageName?.toString() != PIKMIN_PACKAGE) return
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_SCROLLED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                val now = SystemClock.elapsedRealtime()
+                if (prefs.mode == RunMode.RACE) burstUntil = now + EVENT_BURST_MS
+                main.removeCallbacks(eventKick)
+                val wait = max(0L, nextActionAt - now).coerceAtMost(120L)
+                main.postDelayed(eventKick, wait)
+            }
+        }
+    }
+    override fun onInterrupt() = Unit
+    private fun nodeIntervalMs(): Long = when (prefs.mode) {
+        RunMode.ECO -> 3_000L
+        RunMode.WATCH -> 450L
+        RunMode.RACE -> if (SystemClock.elapsedRealtime() < burstUntil) 80L else 160L
+    }
+    private fun ocrIntervalMs(): Long = when (prefs.mode) {
+        RunMode.ECO -> 12_000L
+        RunMode.WATCH -> 1_200L
+        RunMode.RACE -> if (SystemClock.elapsedRealtime() < burstUntil) 300L else 520L
+    }
+    private fun unchangedFrameHoldMs(): Long = when (prefs.mode) {
+        RunMode.ECO -> 8_000L
+        RunMode.WATCH -> 2_000L
+        RunMode.RACE -> 650L
+    }
+    private fun refreshDelayMs(): Long = when (prefs.mode) {
+        RunMode.ECO -> 5_000L
+        RunMode.WATCH -> 1_800L
+        RunMode.RACE -> 650L
+    }
+    private fun birdIdleRescanMs(): Long = when (prefs.mode) {
+        RunMode.ECO -> 4_000L
+        RunMode.WATCH -> 1_100L
+        RunMode.RACE -> 420L
+    }
+    private fun scanOnce() {
+        if (!prefs.enabled) return
+        if (SystemClock.elapsedRealtime() < nextActionAt) return
+        if (prefs.pauseLowBattery && batteryPct() < 20) return
+        resetDailyStopIfNeeded()
+        if (isDoneForToday()) return
+        val root = rootInActiveWindow ?: return
+        if (root.packageName?.toString() != PIKMIN_PACKAGE) return
+        if (handleAccessibilityTree(root)) return
+        requestOcrFallback()
+    }
+    private fun handleAccessibilityTree(root: AccessibilityNodeInfo): Boolean {
+        val entries = collectNodes(root)
+        if (entries.isEmpty()) return false
+        val normalized = clean(entries.joinToString(" ") { it.text })
+        updateDailyRemaining(normalized)
+        if (isDoneForToday()) return true
+        if (containsTicketWarning(normalized) || containsJoinFailure(normalized)) {
+            prepareFailureRecovery()
+            findNode(entries, "關閉")?.let {
+                clickNode(it.node, 220)
+                return true
+            }
+            goBack(220)
+            return true
+        }
+        if (backOutStepsRemaining > 0) {
+            if (isMushroomList(normalized)) {
+                backOutStepsRemaining = 0
+                forceAdvanceOnList = true
+                return false
+            }
+            backOutStepsRemaining--
+            goBack(200)
+            return true
+        }
+        if (normalized.contains("選擇派出皮克敏")) {
+            return handleTeamSelectionNodes(entries, normalized)
+        }
+        if (normalized.contains("參加") && normalized.contains("蘑菇")) {
+            return handleDetailNodes(entries, normalized)
+        }
+        if (isMushroomList(normalized) || normalized.contains("鳥瞰風景")) return false
+        findExactNode(entries, "探險")?.let {
+            val now = SystemClock.elapsedRealtime()
+            if (refreshPending && now < reopenExploreAt) {
+                nextActionAt = reopenExploreAt
+                return true
+            }
+            listSwipeCount = 0
+            lastListPosition = -1
+            stuckListPositionCount = 0
+            refreshPending = false
+            clickNode(it.node, 220)
+            return true
