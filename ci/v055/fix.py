@@ -10,6 +10,13 @@ def one(old: str, new: str, label: str):
         raise SystemExit(f'{label}: expected 1 match, got {n}')
     s = s.replace(old, new, 1)
 
+def exact(old: str, new: str, expected: int, label: str):
+    global s
+    n = s.count(old)
+    if n != expected:
+        raise SystemExit(f'{label}: expected {expected} matches, got {n}')
+    s = s.replace(old, new)
+
 # A RACE session is not allowed to claim it has a respawn prediction until it
 # has actually opened mushroom detail cards and read their finish ETA.
 one(
@@ -37,18 +44,13 @@ one(
 '''            etaInspectionCount++\n            listProgressGeneration++\n            listContextActive = false\n            suppressListMutationEventsUntil =\n                SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS\n            tapOcrButton(frame, title, ETA_DETAIL_OPEN_COOLDOWN_MS)\n''',
 'suppress ETA detail open mutation')
 
-# Same for returning from detail to list.
-one(
+# Both normal ETA detail return and out-of-range ETA return are part of the
+# census. Suppress their own Unity transitions so neither path cancels it.
+exact(
 '''        etaInspectionAdvancePending = true\n        listContextActive = false\n        goBack(ETA_DETAIL_BACK_COOLDOWN_MS)\n''',
 '''        etaInspectionAdvancePending = true\n        listContextActive = false\n        suppressListMutationEventsUntil =\n            SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS\n        goBack(ETA_DETAIL_BACK_COOLDOWN_MS)\n''',
-'suppress ETA detail back mutation')
-
-# Out-of-range cards still count as inspected and their back navigation must
-# not cancel the census either.
-one(
-'''        etaInspectionAdvancePending = true\n        listContextActive = false\n        goBack(ETA_DETAIL_BACK_COOLDOWN_MS)\n    }\n\n    private fun rejectTargetOutOfRange() {\n''',
-'''        etaInspectionAdvancePending = true\n        listContextActive = false\n        suppressListMutationEventsUntil =\n            SystemClock.elapsedRealtime() + ETA_TRANSITION_EVENT_SUPPRESS_MS\n        goBack(ETA_DETAIL_BACK_COOLDOWN_MS)\n    }\n\n    private fun rejectTargetOutOfRange() {\n''',
-'suppress ETA out-of-range back mutation')
+2,
+'suppress both ETA detail return mutations')
 
 # A finished pass is what makes the timing table valid. If no ETA could be
 # parsed at all, retry later instead of pretending a prediction exists.
