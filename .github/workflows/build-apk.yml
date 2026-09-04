@@ -31,6 +31,7 @@ jobs:
           python3 ci/v035/patch.py
           python3 ci/v036/patch.py
           python3 ci/v037/patch.py
+          python3 ci/v038/patch.py
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
