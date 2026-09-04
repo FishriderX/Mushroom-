@@ -1,0 +1,200 @@
+            return
+        }
+        findExactOcrLine(lines, "探險")?.let {
+            val now = SystemClock.elapsedRealtime()
+            if (refreshPending && now < reopenExploreAt) {
+                nextActionAt = reopenExploreAt
+                return
+            }
+            listSwipeCount = 0
+            lastListPosition = -1
+            stuckListPositionCount = 0
+            refreshPending = false
+            tapOcrButton(frame, it, 220)
+        }
+    }
+    private fun handleTeamSelectionOcr(
+        frame: OcrFrame,
+        lines: List<Text.Line>,
+        normalized: String
+    ) {
+        joinTapAttempts = 0
+        if (FULL_TEAM_REGEX.containsMatchIn(normalized)) {
+            autoTapAttempts = 0
+            markJoinSubmission()
+            findOcrLine(lines, "GO")?.let {
+                tapOcrButton(frame, it, 240)
+            } ?: tapSelectionFallback(SelectionButton.GO, 240)
+            return
+        }
+        autoTapAttempts++
+        if (autoTapAttempts > MAX_AUTO_TAP_ATTEMPTS) {
+            startBackOutToNextTarget(2)
+            return
+        }
+        findOcrLine(lines, "自動")?.let {
+            tapOcrButton(frame, it, 180)
+        } ?: tapSelectionFallback(SelectionButton.AUTO, 180)
+    }
+    private fun handleDetailOcr(
+        frame: OcrFrame,
+        lines: List<Text.Line>,
+        normalized: String
+    ) {
+        autoTapAttempts = 0
+        if (!isDesiredForCurrentPhase(normalized)) {
+            rejectDetailAndAdvance()
+            return
+        }
+        val participantCount =
+            extractParticipantCountFromText(normalized)
+                ?: estimateDetailParticipantCount(frame.bitmap, lines)
+        if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+            rejectDetailAndAdvance()
+            return
+        }
+        if (participantCount == null) {
+            rejectDetailAndAdvance()
+            return
+        }
+        joinTapAttempts++
+        if (joinTapAttempts > MAX_JOIN_TAP_ATTEMPTS) {
+            startBackOutToNextTarget(1)
+            return
+        }
+        findOcrLine(lines, "參加")?.let {
+            tapOcrButton(frame, it, 220)
+        } ?: rejectDetailAndAdvance()
+    }
+    private fun handleMushroomList(
+        frame: OcrFrame,
+        lines: List<Text.Line>,
+        normalized: String
+    ) {
+        detailCameFromBirdMap = false
+        lastBirdMapTapKey = null
+        refreshPending = false
+        autoTapAttempts = 0
+        joinTapAttempts = 0
+        val position = extractListPosition(normalized)
+        val reachedEnd = updateListPositionAndCheckEnd(position)
+        if (forceAdvanceOnList) {
+            forceAdvanceOnList = false
+            if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
+                advanceSearchPhaseAndRefresh()
+            } else {
+                listSwipeCount++
+                swipeListReliable(240)
+            }
+            return
+        }
+        val target = chooseOcrTarget(lines)
+        if (target != null) {
+            val participantCount = estimateListParticipantCount(frame.bitmap, target)
+            if (participantCount != null && participantCount >= FREE_SLOT_LIMIT) {
+                if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
+                    advanceSearchPhaseAndRefresh()
+                } else {
+                    listSwipeCount++
+                    swipeListReliable(240)
+                }
+                return
+            }
+            tapOcrButton(frame, target, 220)
+            return
+        }
+        if (reachedEnd || listSwipeCount >= MAX_LIST_SWIPES) {
+            advanceSearchPhaseAndRefresh()
+        } else {
+            listSwipeCount++
+            swipeListReliable(240)
+        }
+    }
+    private fun updateListPositionAndCheckEnd(position: Pair<Int, Int>?): Boolean {
+        if (position == null) return listSwipeCount >= MAX_LIST_SWIPES
+        val current = position.first
+        val total = position.second
+        if (current == lastListPosition && listSwipeCount > 0) {
+            stuckListPositionCount++
+        } else {
+            stuckListPositionCount = 0
+            lastListPosition = current
+        }
+        return current >= total || stuckListPositionCount >= MAX_STUCK_LIST_POSITION
+    }
+    private fun extractListPosition(value: String): Pair<Int, Int>? {
+        val match = LIST_POSITION_REGEX.find(clean(value)) ?: return null
+        val current = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return null
+        val total = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return null
+        if (current <= 0 || total <= 0) return null
+        return current to total
+    }
+    private fun chooseOcrTarget(lines: List<Text.Line>): Text.Line? {
+        return when (phase) {
+            SearchPhase.GIANT -> lines.firstOrNull {
+                val s = clean(it.text)
+                s.contains("巨大") && s.contains("蘑菇")
+            }
+            SearchPhase.EVENT -> lines.firstOrNull { isEventText(it.text) }
+            SearchPhase.ANY -> lines.firstOrNull {
+                val s = clean(it.text)
+                s.contains("蘑菇") &&
+                    !s.contains("今天還剩下") &&
+                    !s.contains("蘑菇儲值券") &&
+                    !s.startsWith("蘑菇：") &&
+                    !s.startsWith("蘑菇:")
+            }
+        }
+    }
+    private fun handleBirdMap(frame: OcrFrame, lines: List<Text.Line>) {
+        listSwipeCount = 0
+        lastListPosition = -1
+        stuckListPositionCount = 0
+        refreshPending = false
+        cleanupRejectedMapPoints()
+        val badges = findMapBadges(frame.bitmap, lines)
+        val candidates = ArrayList<MapCandidate>()
+        badges.forEach { badge ->
+            if (badge.count < FREE_SLOT_LIMIT && !isMapPointRejected(badge.key)) {
+                candidates.add(
+                    MapCandidate(
+                        x = badge.x,
+                        y = badge.y,
+                        key = badge.key,
+                        participantCount = badge.count,
+                        score = 10_000 - badge.count * 500
+                    )
+                )
+            }
+        }
+        candidates.addAll(findUnbadgedMushroomCandidates(frame.bitmap, badges))
+        val best = candidates
+            .filterNot { isMapPointRejected(it.key) }
+            .maxByOrNull { it.score }
+        if (best == null) {
+            nextActionAt = SystemClock.elapsedRealtime() + birdIdleRescanMs()
+            return
+        }
+        detailCameFromBirdMap = true
+        lastBirdMapTapKey = best.key
+        verifiedTap(
+            best.x * frame.scaleX,
+            best.y * frame.scaleY,
+            220
+        )
+    }
+    private fun looksLikeBirdMap(
+        bitmap: Bitmap,
+        lines: List<Text.Line>,
+        normalized: String
+    ): Boolean {
+        if (normalized.contains("鳥瞰風景")) return true
+        if (
+            normalized.contains("今天還剩下") ||
+            normalized.contains("選擇派出皮克敏") ||
+            normalized.contains("參加")
+        ) return false
+        val badges = findMapBadges(bitmap, lines)
+        if (badges.size >= 2) return true
+        return badges.isNotEmpty() && estimateMapGreenRatio(bitmap) >= 0.28f
+    }
