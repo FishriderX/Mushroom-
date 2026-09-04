@@ -85,8 +85,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     @Volatile private var targetMapAnchorY = 0f
     @Volatile private var targetMapEnterDeadline = 0L
     @Volatile private var listTargetStandby = false
-    @Volatile private var listTargetTapX = 0f
-    @Volatile private var listTargetTapY = 0f
+    @Volatile private var predictionRefreshPending = false
+    @Volatile private var predictionRefreshSawExplore = false
+    @Volatile private var predictionRefreshNextAt = 0L
+    @Volatile private var predictionRefreshExitAt = 0L
+    @Volatile private var predictionRefreshCount = 0
     @Volatile private var lastBlindTargetTapAt = 0L
     @Volatile private var blindTargetTapAttempts = 0
     @Volatile private var raceTapVerificationUntil = 0L
@@ -210,17 +213,6 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                         event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                         event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                     if (
-                        listTargetStandby &&
-                        listContextActive &&
-                        isMutation &&
-                        now >= suppressListMutationEventsUntil &&
-                        now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS &&
-                        now <= predictionWindowUntil &&
-                        now - lastBlindTargetTapAt >= RaceTapPolicy.intervalMs(now, predictedSpawnAt)
-                    ) {
-                        tryBlindListTargetTap(now)
-                    }
-                    if (
                         listContextActive &&
                         isMutation &&
                         now >= suppressListMutationEventsUntil &&
@@ -306,12 +298,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return
         }
         if (listTargetStandby && isPredictionPrewarm(now)) {
-            if (handleAccessibilityTree(root)) return
-            if (now < raceTapVerificationUntil) {
-                requestOcrFallback()
+            if (PredictionRefreshPolicy.shouldRefresh(
+                    now, predictedSpawnAt, predictionWindowUntil, predictionRefreshNextAt
+                )
+            ) {
+                triggerPredictionListRefresh(now)
                 return
             }
-            if (now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS && tryBlindListTargetTap(now)) return
         }
 
         if (targetMapLockPending && targetMapEnterDeadline > 0L && now > targetMapEnterDeadline) {
@@ -399,6 +392,15 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (isMushroomList(normalized) || normalized.contains("鳥瞰風景")) return false
         findExactNode(entries, "探險")?.let {
             val now = SystemClock.elapsedRealtime()
+            if (predictionRefreshPending) {
+                predictionRefreshSawExplore = true
+                listSwipeCount = 0
+                lastListPosition = -1
+                stuckListPositionCount = 0
+                refreshPending = false
+                clickNode(it.node, PREDICTION_REENTER_COOLDOWN_MS)
+                return true
+            }
             if (refreshPending && now < reopenExploreAt) {
                 nextActionAt = reopenExploreAt
                 return true
@@ -867,6 +869,15 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         findExactOcrLine(lines, "探險")?.let {
             val now = SystemClock.elapsedRealtime()
+            if (predictionRefreshPending) {
+                predictionRefreshSawExplore = true
+                listSwipeCount = 0
+                lastListPosition = -1
+                stuckListPositionCount = 0
+                refreshPending = false
+                tapOcrButton(frame, it, PREDICTION_REENTER_COOLDOWN_MS)
+                return
+            }
             if (refreshPending && now < reopenExploreAt) {
                 nextActionAt = reopenExploreAt
                 return
@@ -948,6 +959,34 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
 
         val now = SystemClock.elapsedRealtime()
         val position = extractListPosition(normalized)
+
+        if (predictionRefreshPending) {
+            if (!predictionRefreshSawExplore) {
+                // Back did not actually leave the list. Retry the exit instead
+                // of pretending the stale list was refreshed.
+                if (now - predictionRefreshExitAt >= PREDICTION_EXIT_RETRY_MS) {
+                    predictionRefreshExitAt = now
+                    listContextActive = false
+                    goBack(PREDICTION_EXIT_COOLDOWN_MS)
+                } else {
+                    scheduleFreshListScan(PREDICTION_EXIT_RETRY_MS)
+                }
+                return
+            }
+            predictionRefreshPending = false
+            predictionRefreshSawExplore = false
+            listTargetStandby = false
+            parkedAtStart = false
+            phase = firstPhase()
+            raceSweepActive = true
+            raceBackupSweepAt = 0L
+            urgentListChange = false
+            listSwipeCount = 0
+            lastListPosition = -1
+            stuckListPositionCount = 0
+            predictionLastSweepAt = now
+        }
+
         val reachedEnd = updateListPositionAndCheckEnd(position)
 
         if (targetPositioning) {
@@ -964,7 +1003,6 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         // priority search immediately.
         if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby) {
             urgentListChange = false
-            unreachableListPositions.clear()
             etaInspectionActive = false
             etaInspectionAdvancePending = false
             parkedAtStart = false
@@ -1135,9 +1173,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                 RewindResume.STANDBY -> {
                     parkedAtStart = false
                     listTargetStandby = true
-                    targetPositioning = true
-                    targetAdvanceRemaining = (predictedSourcePosition - 1).coerceAtLeast(0)
-                    scheduleFreshListScan(140L)
+                    targetPositioning = false
+                    targetAdvanceRemaining = 0
+                    val now = SystemClock.elapsedRealtime()
+                    if (predictionRefreshNextAt <= 0L) {
+                        predictionRefreshNextAt = PredictionRefreshPolicy.firstRefreshAt(predictedSpawnAt)
+                    }
+                    scheduleFreshListScan((predictionRefreshNextAt - now).coerceAtLeast(180L))
                 }
             }
             return
@@ -1231,19 +1273,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetPositioning = false
         detailSourceListPosition = predictedSourcePosition
         if (listTargetStandby) {
-            val box = title.boundingBox
-            if (box != null) {
-                listTargetTapX = box.exactCenterX() * frame.scaleX
-                listTargetTapY = box.exactCenterY() * frame.scaleY
-            } else {
-                listTargetTapX = resources.displayMetrics.widthPixels * 0.50f
-                listTargetTapY = resources.displayMetrics.heightPixels * 0.62f
-            }
-            blindTargetTapAttempts = 0
-            lastBlindTargetTapAt = 0L
-            scheduleFreshListScan(
-                (predictionReadyAt - SystemClock.elapsedRealtime()).coerceAtLeast(180L)
-            )
+            // List standby never blind-taps a card. Return to card 1 and use a
+            // real exit/re-enter refresh at the predicted time instead.
+            beginRewind(RewindResume.STANDBY)
             return
         }
         targetDetailOpenPending = true
@@ -1306,6 +1338,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         fastMapBaselineReady = false
         fastMapBaselineKeys = emptySet()
         listTargetStandby = true
+        predictionRefreshPending = false
+        predictionRefreshSawExplore = false
+        predictionRefreshNextAt = PredictionRefreshPolicy.firstRefreshAt(predictedSpawnAt)
+        predictionRefreshExitAt = 0L
+        predictionRefreshCount = 0
         blindTargetTapAttempts = 0
         lastBlindTargetTapAt = 0L
         raceTapVerificationUntil = 0L
@@ -1331,36 +1368,43 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             beginRewind(RewindResume.PARK)
             return
         }
-        if (position != null && position.first != predictedSourcePosition) {
-            listTargetStandby = true
+
+        // Wait at card 1. Never use repeated/direct taps on the list surface.
+        if (position != null && position.first != 1) {
             beginRewind(RewindResume.STANDBY)
             return
         }
-        findAnyMushroomTitle(lines)?.boundingBox?.let { box ->
-            listTargetTapX = box.exactCenterX() * frame.scaleX
-            listTargetTapY = box.exactCenterY() * frame.scaleY
+
+        if (predictionRefreshNextAt <= 0L) {
+            predictionRefreshNextAt = PredictionRefreshPolicy.firstRefreshAt(predictedSpawnAt)
         }
-        if (now < predictionReadyAt) {
-            scheduleFreshListScan((predictionReadyAt - now).coerceAtLeast(250L))
+        if (PredictionRefreshPolicy.shouldRefresh(
+                now, predictedSpawnAt, predictionWindowUntil, predictionRefreshNextAt
+            )
+        ) {
+            triggerPredictionListRefresh(now)
             return
         }
-        burstUntil = max(burstUntil, predictionWindowUntil)
-        if (now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS) {
-            tryBlindListTargetTap(now)
-        }
-        scheduleFreshListScan(DIRECT_STANDBY_POLL_MS)
+
+        val wait = (predictionRefreshNextAt - now).coerceIn(180L, 900L)
+        scheduleFreshListScan(wait)
     }
 
-    private fun tryBlindListTargetTap(now: Long): Boolean {
-        if (!listTargetStandby || !listContextActive || predictedSpawnAt <= 0L) return false
-        if (listTargetTapX <= 0f || listTargetTapY <= 0f) return false
-        if (now > predictionWindowUntil) return false
-        if (now - lastBlindTargetTapAt < RaceTapPolicy.intervalMs(now, predictedSpawnAt)) return false
-        lastBlindTargetTapAt = now
-        blindTargetTapAttempts++
-        raceTapVerificationUntil = now + DIRECT_TAP_VERIFY_MS
-        verifiedTap(listTargetTapX, listTargetTapY, DIRECT_TAP_VERIFY_MS)
-        return true
+    private fun triggerPredictionListRefresh(now: Long) {
+        if (predictedSpawnAt <= 0L || now > predictionWindowUntil) return
+        if (predictionRefreshPending) return
+        predictionRefreshPending = true
+        predictionRefreshSawExplore = false
+        predictionRefreshExitAt = now
+        predictionRefreshCount++
+        predictionRefreshNextAt = now + PredictionRefreshPolicy.RETRY_REFRESH_INTERVAL_MS
+        listTargetStandby = false
+        parkedAtStart = false
+        raceSweepActive = false
+        urgentListChange = false
+        listContextActive = false
+        main.removeCallbacks(listWatchdogKick)
+        goBack(PREDICTION_EXIT_COOLDOWN_MS)
     }
 
     private fun tryBlindMapTargetTap(now: Long): Boolean {
@@ -1524,8 +1568,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetMapAnchorY = 0f
         targetMapEnterDeadline = 0L
         listTargetStandby = false
-        listTargetTapX = 0f
-        listTargetTapY = 0f
+        predictionRefreshPending = false
+        predictionRefreshSawExplore = false
+        predictionRefreshNextAt = 0L
+        predictionRefreshExitAt = 0L
+        predictionRefreshCount = 0
         lastBlindTargetTapAt = 0L
         blindTargetTapAttempts = 0
         raceTapVerificationUntil = 0L
@@ -2124,7 +2171,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
 
         phase = firstPhase()
         val now = SystemClock.elapsedRealtime()
-        if (predictedSpawnAt > 0L || now < nextEtaInspectionAt) {
+        if (predictedSpawnAt > 0L && isPredictionPrewarm(now)) {
+            predictionRefreshNextAt = max(
+                predictionRefreshNextAt,
+                now + PredictionRefreshPolicy.RETRY_REFRESH_INTERVAL_MS
+            )
+            beginRewind(RewindResume.STANDBY)
+        } else if (predictedSpawnAt > 0L || now < nextEtaInspectionAt) {
             beginRewind(RewindResume.PARK)
         } else {
             beginRewind(RewindResume.INSPECT)
@@ -2506,6 +2559,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetMapAnchorReady = false
         targetMapEnterDeadline = 0L
         listTargetStandby = false
+        predictionRefreshPending = false
+        predictionRefreshSawExplore = false
         main.removeCallbacks(listWatchdogKick)
         main.removeCallbacksAndMessages(null)
         ocrBusy.set(false)
@@ -2571,7 +2626,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val FAST_MAP_Y_RADIUS = 0.14f
         private const val DIRECT_TAP_LEAD_MS = 800L
         private const val DIRECT_TAP_VERIFY_MS = 260L
-        private const val DIRECT_STANDBY_POLL_MS = 180L
+        private const val PREDICTION_EXIT_COOLDOWN_MS = 120L
+        private const val PREDICTION_EXIT_RETRY_MS = 420L
+        private const val PREDICTION_REENTER_COOLDOWN_MS = 140L
         private const val MUSHROOM_RESPAWN_DELAY_MS = 5L * 60L * 1000L
         private const val PREDICTION_PREWARM_LEAD_MS = 30_000L
         private const val PREDICTION_AFTER_WINDOW_MS = 90_000L
