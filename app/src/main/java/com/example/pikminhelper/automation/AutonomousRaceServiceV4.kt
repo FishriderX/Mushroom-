@@ -83,6 +83,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     @Volatile private var targetMapAnchorReady = false
     @Volatile private var targetMapAnchorX = 0f
     @Volatile private var targetMapAnchorY = 0f
+    @Volatile private var targetMapEnterDeadline = 0L
+    @Volatile private var listTargetStandby = false
+    @Volatile private var listTargetTapX = 0f
+    @Volatile private var listTargetTapY = 0f
+    @Volatile private var lastBlindTargetTapAt = 0L
+    @Volatile private var blindTargetTapAttempts = 0
+    @Volatile private var raceTapVerificationUntil = 0L
     @Volatile private var rewindResume: RewindResume = RewindResume.SEARCH
     @Volatile private var forceAdvanceOnList = false
     @Volatile private var refreshPending = false
@@ -99,7 +106,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     private val rejectedBirdMapPoints = ConcurrentHashMap<Int, Long>()
     private val unreachableListPositions = ConcurrentHashMap<Int, Long>()
     private enum class SearchPhase { GIANT, EVENT, ANY }
-    private enum class RewindResume { SEARCH, INSPECT, PARK, TARGET }
+    private enum class RewindResume { SEARCH, INSPECT, PARK, TARGET, STANDBY }
     private enum class SelectionButton { AUTO, GO }
     private data class NodeEntry(
         val node: AccessibilityNodeInfo,
@@ -203,6 +210,17 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                         event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
                         event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
                     if (
+                        listTargetStandby &&
+                        listContextActive &&
+                        isMutation &&
+                        now >= suppressListMutationEventsUntil &&
+                        now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS &&
+                        now <= predictionWindowUntil &&
+                        now - lastBlindTargetTapAt >= DIRECT_TARGET_TAP_INTERVAL_MS
+                    ) {
+                        tryBlindListTargetTap(now)
+                    }
+                    if (
                         listContextActive &&
                         isMutation &&
                         now >= suppressListMutationEventsUntil &&
@@ -274,12 +292,30 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         val root = rootInActiveWindow ?: return
         if (root.packageName?.toString() != PIKMIN_PACKAGE) return
 
-        // Bird-view RACE never waits for whole-screen Chinese OCR. Android
-        // limits Accessibility screenshots to roughly one every 333 ms, so
-        // this path polls at a safe 350 ms cadence and performs only local
-        // pixel analysis around the locked mushroom location.
+        // During a verified target standby, critical taps no longer wait for
+        // OCR/image recognition. First give the accessibility tree a chance to
+        // notice that a previous tap already opened detail/team selection.
         if (targetMapLockActive && isPredictionPrewarm(now)) {
+            if (handleAccessibilityTree(root)) return
+            if (now < raceTapVerificationUntil) {
+                requestOcrFallback()
+                return
+            }
+            if (now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS && tryBlindMapTargetTap(now)) return
             requestTargetMapFastFrame()
+            return
+        }
+        if (listTargetStandby && isPredictionPrewarm(now)) {
+            if (handleAccessibilityTree(root)) return
+            if (now < raceTapVerificationUntil) {
+                requestOcrFallback()
+                return
+            }
+            if (now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS && tryBlindListTargetTap(now)) return
+        }
+
+        if (targetMapLockPending && targetMapEnterDeadline > 0L && now > targetMapEnterDeadline) {
+            fallbackToListTargetStandby()
             return
         }
 
@@ -324,9 +360,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                 targetDetailOpenPending = false
                 targetMapOpenAttempts = 0
                 targetMapLockPending = true
+                targetMapEnterDeadline = SystemClock.elapsedRealtime() + TARGET_MAP_ENTER_TIMEOUT_MS
                 clickNode(it.node, TARGET_MAP_OPEN_COOLDOWN_MS)
                 return true
             }
+            return false
+        }
+        if (targetMapLockPending && normalized.contains("鳥瞰風景")) {
+            activateTargetMapLock()
             return false
         }
         if (etaInspectionActive && looksLikeMushroomDetail(normalized)) {
@@ -410,6 +451,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         joinTapAttempts++
         if (joinTapAttempts > MAX_JOIN_TAP_ATTEMPTS) {
+            markCurrentTargetUnreachable()
             startBackOutToNextTarget(1)
             return true
         }
@@ -782,23 +824,22 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             goBack(220)
             return
         }
-        val forcedTargetBirdMap =
-            targetMapLockPending &&
-                !looksLikeMushroomDetail(normalized) &&
-                !isMushroomList(normalized) &&
-                !ExploreScreenRules.isDecorOnlyExplore(normalized)
-        if (forcedTargetBirdMap || looksLikeBirdMap(frame.bitmap, lines, normalized)) {
+        val verifiedBirdMap = looksLikeBirdMap(frame.bitmap, lines, normalized)
+        if (targetMapLockPending && verifiedBirdMap) {
             listContextActive = false
-            if (targetMapLockPending) {
-                targetMapLockPending = false
-                targetMapLockActive = true
-                targetMapAnchorReady = false
-                fastMapBaselineReady = false
-                fastMapBaselineKeys = emptySet()
-                lastFastMapScreenshotAt = 0L
-                targetMapOpenAttempts = 0
-            }
+            activateTargetMapLock()
             handleBirdMap(frame, lines)
+            return
+        }
+        if (verifiedBirdMap) {
+            listContextActive = false
+            handleBirdMap(frame, lines)
+            return
+        }
+        if (targetMapLockPending && targetMapEnterDeadline > 0L &&
+            SystemClock.elapsedRealtime() > targetMapEnterDeadline
+        ) {
+            fallbackToListTargetStandby()
             return
         }
         findExactOcrLine(lines, "探險")?.let {
@@ -861,6 +902,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         }
         joinTapAttempts++
         if (joinTapAttempts > MAX_JOIN_TAP_ATTEMPTS) {
+            markCurrentTargetUnreachable()
             startBackOutToNextTarget(1)
             return
         }
@@ -888,11 +930,15 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             handleTargetPositioningList(frame, lines, reachedEnd, position)
             return
         }
+        if (listTargetStandby) {
+            handleListTargetStandby(frame, lines, position)
+            return
+        }
 
         // A genuine Pikmin list mutation outranks whatever old scan was doing.
         // Stop inspection/patrol, return to card 1 if needed, then run a fresh
         // priority search immediately.
-        if (prefs.mode == RunMode.RACE && urgentListChange) {
+        if (prefs.mode == RunMode.RACE && urgentListChange && !listTargetStandby) {
             urgentListChange = false
             unreachableListPositions.clear()
             etaInspectionActive = false
@@ -1056,6 +1102,14 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
                 RewindResume.PARK -> parkAtStart()
                 RewindResume.TARGET -> {
                     parkedAtStart = false
+                    listTargetStandby = false
+                    targetPositioning = true
+                    targetAdvanceRemaining = (predictedSourcePosition - 1).coerceAtLeast(0)
+                    scheduleFreshListScan(140L)
+                }
+                RewindResume.STANDBY -> {
+                    parkedAtStart = false
+                    listTargetStandby = true
                     targetPositioning = true
                     targetAdvanceRemaining = (predictedSourcePosition - 1).coerceAtLeast(0)
                     scheduleFreshListScan(140L)
@@ -1151,6 +1205,22 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
 
         targetPositioning = false
         detailSourceListPosition = predictedSourcePosition
+        if (listTargetStandby) {
+            val box = title.boundingBox
+            if (box != null) {
+                listTargetTapX = box.exactCenterX() * frame.scaleX
+                listTargetTapY = box.exactCenterY() * frame.scaleY
+            } else {
+                listTargetTapX = resources.displayMetrics.widthPixels * 0.50f
+                listTargetTapY = resources.displayMetrics.heightPixels * 0.62f
+            }
+            blindTargetTapAttempts = 0
+            lastBlindTargetTapAt = 0L
+            scheduleFreshListScan(
+                (predictionReadyAt - SystemClock.elapsedRealtime()).coerceAtLeast(180L)
+            )
+            return
+        }
         targetDetailOpenPending = true
         targetMapOpenAttempts = 0
         listProgressGeneration++
@@ -1163,6 +1233,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             targetDetailOpenPending = false
             targetMapOpenAttempts = 0
             targetMapLockPending = true
+            targetMapEnterDeadline = SystemClock.elapsedRealtime() + TARGET_MAP_ENTER_TIMEOUT_MS
             tapOcrButton(frame, goToMap, TARGET_MAP_OPEN_COOLDOWN_MS)
             return
         }
@@ -1176,11 +1247,108 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             return
         }
 
-        // Safe failure: return to list and keep the prediction rather than
-        // tapping an unverified coordinate on the detail page.
+        // Bird-view navigation is optional. If Pikmin does not expose a
+        // reliable way to open the remote bird view, fall back to parking on
+        // the known target card instead of wandering or stalling.
         targetDetailOpenPending = false
         targetMapOpenAttempts = 0
-        goBack(220L)
+        fallbackToListTargetStandby(fromDetail = true)
+    }
+
+    private fun activateTargetMapLock() {
+        targetMapLockPending = false
+        targetMapLockActive = true
+        targetMapEnterDeadline = 0L
+        targetMapAnchorReady = true
+        targetMapAnchorX = resources.displayMetrics.widthPixels * TARGET_MAP_CENTER_X
+        targetMapAnchorY = resources.displayMetrics.heightPixels * TARGET_MAP_CENTER_Y
+        fastMapBaselineReady = false
+        fastMapBaselineKeys = emptySet()
+        lastFastMapScreenshotAt = 0L
+        blindTargetTapAttempts = 0
+        lastBlindTargetTapAt = 0L
+        raceTapVerificationUntil = 0L
+        listTargetStandby = false
+        targetMapOpenAttempts = 0
+    }
+
+    private fun fallbackToListTargetStandby(fromDetail: Boolean = false) {
+        targetMapLockPending = false
+        targetMapLockActive = false
+        targetMapEnterDeadline = 0L
+        targetDetailOpenPending = false
+        targetMapOpenAttempts = 0
+        fastMapBaselineReady = false
+        fastMapBaselineKeys = emptySet()
+        listTargetStandby = true
+        blindTargetTapAttempts = 0
+        lastBlindTargetTapAt = 0L
+        raceTapVerificationUntil = 0L
+        if (fromDetail) {
+            goBack(220L)
+            main.postDelayed({
+                if (prefs.enabled && predictedSpawnAt > 0L) beginRewind(RewindResume.STANDBY)
+            }, 300L)
+        } else {
+            beginRewind(RewindResume.STANDBY)
+        }
+    }
+
+    private fun handleListTargetStandby(
+        frame: OcrFrame,
+        lines: List<Text.Line>,
+        position: Pair<Int, Int>?
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        if (predictedSpawnAt <= 0L || now > predictionWindowUntil) {
+            listTargetStandby = false
+            clearPrediction()
+            beginRewind(RewindResume.PARK)
+            return
+        }
+        if (position != null && position.first != predictedSourcePosition) {
+            listTargetStandby = true
+            beginRewind(RewindResume.STANDBY)
+            return
+        }
+        findAnyMushroomTitle(lines)?.boundingBox?.let { box ->
+            listTargetTapX = box.exactCenterX() * frame.scaleX
+            listTargetTapY = box.exactCenterY() * frame.scaleY
+        }
+        if (now < predictionReadyAt) {
+            scheduleFreshListScan((predictionReadyAt - now).coerceAtLeast(250L))
+            return
+        }
+        burstUntil = max(burstUntil, predictionWindowUntil)
+        if (now >= predictedSpawnAt - DIRECT_TAP_LEAD_MS) {
+            tryBlindListTargetTap(now)
+        }
+        scheduleFreshListScan(DIRECT_STANDBY_POLL_MS)
+    }
+
+    private fun tryBlindListTargetTap(now: Long): Boolean {
+        if (!listTargetStandby || !listContextActive || predictedSpawnAt <= 0L) return false
+        if (listTargetTapX <= 0f || listTargetTapY <= 0f) return false
+        if (now > predictionWindowUntil) return false
+        if (now - lastBlindTargetTapAt < DIRECT_TARGET_TAP_INTERVAL_MS) return false
+        if (blindTargetTapAttempts >= MAX_DIRECT_TARGET_TAPS) return false
+        lastBlindTargetTapAt = now
+        blindTargetTapAttempts++
+        raceTapVerificationUntil = now + DIRECT_TAP_VERIFY_MS
+        verifiedTap(listTargetTapX, listTargetTapY, DIRECT_TAP_VERIFY_MS)
+        return true
+    }
+
+    private fun tryBlindMapTargetTap(now: Long): Boolean {
+        if (!targetMapLockActive || !targetMapAnchorReady || predictedSpawnAt <= 0L) return false
+        if (now > predictionWindowUntil) return false
+        if (now - lastBlindTargetTapAt < DIRECT_TARGET_TAP_INTERVAL_MS) return false
+        if (blindTargetTapAttempts >= MAX_DIRECT_TARGET_TAPS) return false
+        lastBlindTargetTapAt = now
+        blindTargetTapAttempts++
+        raceTapVerificationUntil = now + DIRECT_TAP_VERIFY_MS
+        verifiedTap(targetMapAnchorX, targetMapAnchorY, DIRECT_TAP_VERIFY_MS)
+        return true
     }
 
     private fun findGoToMapLine(lines: List<Text.Line>): Text.Line? =
@@ -1331,6 +1499,13 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetMapAnchorReady = false
         targetMapAnchorX = 0f
         targetMapAnchorY = 0f
+        targetMapEnterDeadline = 0L
+        listTargetStandby = false
+        listTargetTapX = 0f
+        listTargetTapY = 0f
+        lastBlindTargetTapAt = 0L
+        blindTargetTapAttempts = 0
+        raceTapVerificationUntil = 0L
         fastMapBaselineReady = false
         fastMapBaselineKeys = emptySet()
         lastFastMapScreenshotAt = 0L
@@ -1383,40 +1558,12 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             handleTargetLockedBirdMap(frame, lines)
             return
         }
-        val badges = findMapBadges(frame.bitmap, lines)
-        val candidates = ArrayList<MapCandidate>()
-        badges.forEach { badge ->
-            if (badge.count < FREE_SLOT_LIMIT && !isMapPointRejected(badge.key)) {
-                candidates.add(
-                    MapCandidate(
-                        x = badge.x,
-                        y = badge.y,
-                        key = badge.key,
-                        participantCount = badge.count,
-                        score = 10_000 - badge.count * 500
-                    )
-                )
-            }
-        }
-        val explicitBirdView = lines.any { clean(it.text).contains("鳥瞰風景") }
-        if (explicitBirdView || badges.size >= 2) {
-            candidates.addAll(findUnbadgedMushroomCandidates(frame.bitmap, badges))
-        }
-        val best = candidates
-            .filter { isWithinLocalBirdSearchArea(it.x, it.y, frame.bitmap) }
-            .filterNot { isMapPointRejected(it.key) }
-            .maxByOrNull { it.score }
-        if (best == null) {
-            nextActionAt = SystemClock.elapsedRealtime() + birdIdleRescanMs()
-            return
-        }
-        detailCameFromBirdMap = true
-        lastBirdMapTapKey = best.key
-        verifiedTap(
-            best.x * frame.scaleX,
-            best.y * frame.scaleY,
-            220
-        )
+
+        // Never roam an arbitrary bird-view map. Its visible area is not the
+        // same thing as Pikmin's joinable mushroom range, and flower graphics
+        // can resemble mushrooms. Bird view is race-only after a verified
+        // target navigation from a reachable mushroom detail page.
+        nextActionAt = SystemClock.elapsedRealtime() + BIRD_UNTARGETED_IDLE_MS
     }
     private fun isWithinLocalBirdSearchArea(x: Float, y: Float, bitmap: Bitmap): Boolean {
         val centerX = bitmap.width * TARGET_MAP_CENTER_X
@@ -2026,8 +2173,19 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
     }
     private fun isOutOfRangeDetail(entries: List<NodeEntry>, normalized: String): Boolean {
         if (MushroomReachability.isOutOfRangeText(normalized)) return true
-        val join = findNode(entries, "參加") ?: return false
-        return !join.node.isEnabled
+        val joins = entries.filter { clean(it.text).contains("參加") }
+        for (entry in joins) {
+            var node: AccessibilityNodeInfo? = entry.node
+            repeat(5) {
+                val candidate = node ?: return@repeat
+                if (candidate.isClickable) return !candidate.isEnabled
+                node = candidate.parent
+            }
+        }
+        // No actionable accessibility node is inconclusive for Unity, not an
+        // out-of-range signal. OCR text warnings and failed join attempts are
+        // used as the safe fallbacks.
+        return false
     }
 
     private fun markCurrentTargetUnreachable() {
@@ -2298,6 +2456,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         targetMapLockPending = false
         targetMapLockActive = false
         targetMapAnchorReady = false
+        targetMapEnterDeadline = 0L
+        listTargetStandby = false
         main.removeCallbacks(listWatchdogKick)
         main.removeCallbacksAndMessages(null)
         ocrBusy.set(false)
@@ -2347,7 +2507,9 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val TARGET_CARD_RETRY_MS = 220L
         private const val TARGET_MAP_OPEN_COOLDOWN_MS = 300L
         private const val TARGET_MAP_BUTTON_RETRY_MS = 180L
+        private const val TARGET_MAP_ENTER_TIMEOUT_MS = 1_600L
         private const val MAX_TARGET_MAP_OPEN_ATTEMPTS = 4
+        private const val BIRD_UNTARGETED_IDLE_MS = 1_500L
         private const val TARGET_MAP_IDLE_MIN_MS = 600L
         private const val TARGET_MAP_IDLE_MAX_MS = 2_000L
         private const val TARGET_MAP_RACE_POLL_MS = 120L
@@ -2358,6 +2520,11 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val FAST_MAP_MIN_PATCH_SCORE = 42
         private const val FAST_MAP_X_RADIUS = 0.18f
         private const val FAST_MAP_Y_RADIUS = 0.14f
+        private const val DIRECT_TAP_LEAD_MS = 800L
+        private const val DIRECT_TARGET_TAP_INTERVAL_MS = 380L
+        private const val DIRECT_TAP_VERIFY_MS = 260L
+        private const val DIRECT_STANDBY_POLL_MS = 180L
+        private const val MAX_DIRECT_TARGET_TAPS = 8
         private const val MUSHROOM_RESPAWN_DELAY_MS = 5L * 60L * 1000L
         private const val PREDICTION_PREWARM_LEAD_MS = 30_000L
         private const val PREDICTION_AFTER_WINDOW_MS = 90_000L
