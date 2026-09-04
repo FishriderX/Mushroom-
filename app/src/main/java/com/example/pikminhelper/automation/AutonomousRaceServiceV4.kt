@@ -291,6 +291,12 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (normalized.contains("參加") && normalized.contains("蘑菇")) {
             return handleDetailNodes(entries, normalized)
         }
+        if (ExploreScreenRules.isDecorOnlyExplore(normalized)) {
+            listContextActive = false
+            main.removeCallbacks(listWatchdogKick)
+            nextActionAt = SystemClock.elapsedRealtime() + DECOR_GUARD_RETRY_MS
+            return true
+        }
         if (isMushroomList(normalized) || normalized.contains("鳥瞰風景")) return false
         findExactNode(entries, "探險")?.let {
             val now = SystemClock.elapsedRealtime()
@@ -502,6 +508,12 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         if (normalized.contains("參加") && normalized.contains("蘑菇")) {
             listContextActive = false
             handleDetailOcr(frame, lines, normalized)
+            return
+        }
+        if (ExploreScreenRules.isDecorOnlyExplore(normalized)) {
+            listContextActive = false
+            main.removeCallbacks(listWatchdogKick)
+            nextActionAt = SystemClock.elapsedRealtime() + DECOR_GUARD_RETRY_MS
             return
         }
         if (isMushroomList(normalized)) {
@@ -1519,13 +1531,8 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
             normalized.contains("無法加入") ||
             normalized.contains("參加人數已滿")
     }
-    private fun isMushroomList(normalized: String): Boolean {
-        val s = clean(normalized)
-        val dailyHeader = s.contains("今天還剩下") && s.contains("蘑菇")
-        val exploreBody = s.contains("花苗和水果") &&
-            (s.contains("飾品一覽") || s.contains("蘑菇"))
-        return dailyHeader || exploreBody
-    }
+    private fun isMushroomList(normalized: String): Boolean =
+        ExploreScreenRules.isMushroomList(normalized)
     private fun looksLikeMushroomDetail(normalized: String): Boolean {
         val value = clean(normalized)
         if (!value.contains("蘑菇")) return false
@@ -1696,6 +1703,7 @@ class AutonomousRaceServiceV4 : AccessibilityService() {
         private const val LIST_BUSY_RETRY_MS = 140L
         private const val LIST_PROGRESS_GUARD_MS = 900L
         private const val LIST_STALL_RETRY_MS = 180L
+        private const val DECOR_GUARD_RETRY_MS = 350L
         private const val RACE_BACKUP_SWEEP_MS = 20_000L
         private const val RACE_SWEEP_COOLDOWN_MS = 150L
         private const val RACE_REWIND_COOLDOWN_MS = 120L
